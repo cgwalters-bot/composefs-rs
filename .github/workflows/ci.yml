@@ -72,11 +72,11 @@ jobs:
         with:
           workspaces: crates/composefs/fuzz
       - name: Install cargo-fuzz
-        # Use cargo-fuzz 0.13.1 without --locked so cargo resolves fresh deps;
+        # Use cargo-fuzz 0.13.2 without --locked so cargo resolves fresh deps;
         # the published lockfile pins rustix 0.36 which fails to compile with
         # nightly ≥ 1.97 (rustc_layout_scalar_valid_range_* now reserved for
         # the compiler).
-        run: cargo install cargo-fuzz@0.13.1
+        run: cargo install cargo-fuzz@0.13.2
       - name: Generate corpus
         run: just generate-corpus
       - name: Run fuzz targets
