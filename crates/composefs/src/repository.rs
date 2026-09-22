@@ -637,6 +637,29 @@ fn repo_format_config_from_meta(meta: &RepoMetadata) -> FormatConfig {
     meta.format_config()
 }
 
+/// Write the serialized `meta` into `file`, fsync it, and return a
+/// read-only fd for the same inode.
+///
+/// If `enable_verity` is true, fs-verity is enabled on the returned fd;
+/// this is what marks a repository as requiring verity on all objects
+/// (see [`Repository::open_path`]).
+fn write_repo_metadata_file(
+    repo_fd: &impl AsFd,
+    mut file: File,
+    meta: &RepoMetadata,
+    enable_verity: bool,
+) -> Result<OwnedFd> {
+    let data = meta.to_json()?;
+    file.write_all(&data).context("writing metadata")?;
+    file.sync_all().context("syncing metadata")?;
+    let ro_fd = reopen_tmpfile_ro(file).context("re-opening metadata read-only")?;
+    if enable_verity {
+        enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+            .context("enabling verity on meta.json")?;
+    }
+    Ok(ro_fd)
+}
+
 /// Write `meta.json` into a repository directory fd.
 ///
 /// This atomically writes (via O_TMPFILE + linkat) the metadata file.
@@ -652,8 +675,6 @@ pub(crate) fn write_repo_metadata(
     meta: &RepoMetadata,
     enable_verity: bool,
 ) -> Result<()> {
-    let data = meta.to_json()?;
-
     // Try O_TMPFILE for atomic creation
     match openat(
         repo_fd,
@@ -662,18 +683,7 @@ pub(crate) fn write_repo_metadata(
         Mode::from_raw_mode(0o644),
     ) {
         Ok(fd) => {
-            let mut file = File::from(fd);
-            file.write_all(&data)
-                .context("writing metadata to tmpfile")?;
-            file.sync_all().context("syncing metadata tmpfile")?;
-
-            let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
-
-            if enable_verity {
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
-            }
-
+            let ro_fd = write_repo_metadata_file(repo_fd, File::from(fd), meta, enable_verity)?;
             linkat(
                 CWD,
                 proc_self_fd(&ro_fd),
@@ -694,22 +704,7 @@ pub(crate) fn write_repo_metadata(
                 Mode::from_raw_mode(0o644),
             )
             .context("creating meta.json")?;
-            let mut file = File::from(fd);
-            file.write_all(&data).context("writing meta.json")?;
-            file.sync_all().context("syncing meta.json to disk")?;
-
-            if enable_verity {
-                let ro_fd = openat(
-                    repo_fd,
-                    REPO_METADATA_FILENAME,
-                    OFlags::RDONLY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .context("re-opening meta.json for verity")?;
-                drop(file);
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
-            }
+            write_repo_metadata_file(repo_fd, File::from(fd), meta, enable_verity)?;
         }
         Err(e) => {
             return Err(e).context("creating tmpfile for meta.json")?;
