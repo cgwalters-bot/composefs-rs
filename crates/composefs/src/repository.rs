@@ -68,11 +68,19 @@
 //! In "insecure" mode, fs-verity is not required, allowing operation on filesystems
 //! like tmpfs or overlayfs.
 //!
+//! The mode is not a field in `meta.json`; instead a repository is secure if
+//! and only if `meta.json` itself has fs-verity enabled.  It is chosen when the
+//! repository is created (see [`RepositoryConfig::set_insecure`]) and can later
+//! be relaxed from secure to insecure with [`Repository::persist_insecure`];
+//! [`Repository::set_insecure`] relaxes only a single open handle.
+//!
 //! # Concurrency
 //!
 //! The repository uses advisory file locking (flock) to coordinate concurrent access.
 //! Opening a repository acquires a shared lock, while garbage collection requires
 //! an exclusive lock. This ensures GC cannot run while other processes have the
+//! repository open.  [`Repository::persist_insecure`] also briefly takes an
+//! exclusive lock, but fails instead of waiting if another handle has the
 //! repository open.
 //!
 //! For more details, see the [repository design documentation](../../../doc/repository.md).
@@ -102,7 +110,7 @@ use rustix::{
     fs::{
         Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
         StatVfsMountFlags, accessat, flock, fstatvfs, fsync, linkat, mkdirat, openat, readlinkat,
-        renameat_with, statat, syncfs, unlinkat,
+        renameat, renameat_with, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -523,6 +531,9 @@ impl RepositoryConfig {
     ///
     /// Suitable for use on filesystems that do not support fs-verity (tmpfs,
     /// overlayfs) or in test environments.  Returns `self` for chaining.
+    ///
+    /// A repository created in secure mode can later be switched with
+    /// [`Repository::persist_insecure`].
     pub fn set_insecure(mut self) -> Self {
         self.insecure = true;
         self
@@ -726,6 +737,42 @@ pub(crate) fn write_repo_metadata(
             return Err(e).context("creating tmpfile for meta.json")?;
         }
     }
+    Ok(())
+}
+
+/// Atomically replace an existing `meta.json` with `data`, without fs-verity.
+///
+/// The new contents are written to a named temporary file which is
+/// fsynced and then renamed over `meta.json`; the directory is fsynced
+/// afterwards so the rename is durable.  Since the security mode is
+/// encoded as fs-verity on `meta.json`, this is how a repository is
+/// switched to insecure mode (see [`Repository::persist_insecure`]).
+#[context("Replacing repository metadata")]
+fn replace_repo_metadata_insecure(repo_fd: &impl AsFd, data: &[u8]) -> Result<()> {
+    let tmpname = generate_tmpname(".meta.json.tmp-");
+    let fd = openat(
+        repo_fd,
+        &tmpname,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .with_context(|| format!("creating {tmpname}"))?;
+    let mut file = File::from(fd);
+    let replaced = file
+        .write_all(data)
+        .context("writing metadata")
+        .and_then(|()| file.sync_all().context("syncing metadata"))
+        .and_then(|()| {
+            renameat(repo_fd, &tmpname, repo_fd, REPO_METADATA_FILENAME)
+                .context("renaming new meta.json into place")
+        });
+    if let Err(e) = replaced {
+        if let Err(unlink_err) = unlinkat(repo_fd, &tmpname, AtFlags::empty()) {
+            log::warn!("failed to remove {tmpname}: {unlink_err}");
+        }
+        return Err(e);
+    }
+    fsync(repo_fd).context("syncing repository directory")?;
     Ok(())
 }
 
@@ -1520,7 +1567,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// The repository's security mode is auto-detected: if `meta.json`
     /// has fs-verity enabled the repo requires verity on all objects
     /// (secure mode).  Otherwise the repository operates in insecure
-    /// mode.  Use [`set_insecure`] to override after opening.
+    /// mode.  Use [`set_insecure`](Self::set_insecure) to override for
+    /// this handle only, or [`persist_insecure`](Self::persist_insecure)
+    /// to switch the repository itself to insecure mode.
     pub fn open_path(
         dirfd: impl AsFd,
         path: impl AsRef<Path>,
@@ -1676,6 +1725,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     fn read_and_probe_metadata(
         repo_fd: &OwnedFd,
     ) -> Result<(RepoMetadata, bool), RepositoryOpenError> {
+        let (_, meta, has_verity) = Self::read_and_probe_metadata_bytes(repo_fd)?;
+        Ok((meta, has_verity))
+    }
+
+    /// Like [`read_and_probe_metadata`](Self::read_and_probe_metadata),
+    /// but also returns the raw contents of `meta.json`.
+    fn read_and_probe_metadata_bytes(
+        repo_fd: &OwnedFd,
+    ) -> Result<(Vec<u8>, RepoMetadata, bool), RepositoryOpenError> {
         let meta_fd = match openat(
             repo_fd,
             REPO_METADATA_FILENAME,
@@ -1699,17 +1757,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         };
 
         // Clone the fd: one for reading, one for the verity probe.
-        let read_fd = meta_fd.try_clone()?;
+        let mut data = Vec::new();
+        File::from(meta_fd.try_clone()?).read_to_end(&mut data)?;
         let meta: RepoMetadata =
-            serde_json::from_reader(std::io::BufReader::new(File::from(read_fd)))
-                .map_err(RepositoryOpenError::MetadataInvalid)?;
+            serde_json::from_slice(&data).map_err(RepositoryOpenError::MetadataInvalid)?;
 
         // Probe verity on the original fd.
         let has_verity = measure_verity_opt::<ObjectID>(&meta_fd)
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .is_some();
 
-        Ok((meta, has_verity))
+        Ok((data, meta, has_verity))
     }
 
     /// Open the default user-owned composefs repository.
@@ -2430,7 +2488,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns whether the repository is in insecure mode.
     ///
     /// This is auto-detected from whether `meta.json` has fs-verity
-    /// enabled, but can be overridden with [`set_insecure`].
+    /// enabled, but can be overridden with [`set_insecure`](Self::set_insecure)
+    /// or [`persist_insecure`](Self::persist_insecure).
     pub fn is_insecure(&self) -> bool {
         self.insecure
     }
@@ -2448,12 +2507,114 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self
     }
 
-    /// Mark this repository as insecure, disabling verification of
+    /// Mark this repository handle as insecure, disabling verification of
     /// fs-verity digests.  This allows operation on filesystems
     /// without verity support.
+    ///
+    /// This only affects this in-memory handle; the on-disk mode is
+    /// unchanged and a later [`open_path`](Self::open_path) will detect
+    /// it again from `meta.json`.  Use
+    /// [`persist_insecure`](Self::persist_insecure) to change the mode
+    /// persistently.
     pub fn set_insecure(&mut self) -> &mut Self {
         self.insecure = true;
         self
+    }
+
+    /// Persistently switch this repository from secure to insecure mode.
+    ///
+    /// This is the on-disk counterpart of [`set_insecure`](Self::set_insecure):
+    /// `meta.json` is atomically replaced with byte-identical contents but
+    /// without fs-verity, so that this handle and every later
+    /// [`open_path`](Self::open_path) treat the repository as insecure.
+    /// It is intended for callers that create a repository in secure mode
+    /// and only later learn that missing fs-verity must be tolerated.
+    ///
+    /// If `meta.json` already lacks fs-verity this is a no-op apart from
+    /// updating this handle.  There is intentionally no inverse
+    /// operation: objects written while the repository was insecure may
+    /// lack fs-verity, so re-enabling it on `meta.json` would claim a
+    /// guarantee the existing objects don't provide.  Re-create the
+    /// repository instead.
+    ///
+    /// # Locking
+    ///
+    /// Taking `&mut self` ensures no other user of this handle is
+    /// operating on the repository concurrently.  Other handles (in this
+    /// or another process) are excluded by converting this handle's
+    /// shared lock to an exclusive one for the duration of the rewrite.
+    /// That attempt does not block: if any other handle has the
+    /// repository open, an error is returned rather than waiting (which
+    /// would deadlock if that handle is held by the caller itself).  The
+    /// shared lock is restored before returning, including on error.
+    ///
+    /// Note that `flock` lock conversion is not atomic, so the lock is
+    /// briefly released on either side of the rewrite; restoring the shared
+    /// lock may therefore wait for e.g. a concurrent [`gc`](Self::gc) that
+    /// grabbed the exclusive lock in that window.  Callers should be done
+    /// writing to the repository before calling this.
+    #[context("Persisting insecure mode for repository")]
+    pub fn persist_insecure(&mut self) -> Result<()> {
+        if !self.metadata_has_verity()? {
+            self.insecure = true;
+            return Ok(());
+        }
+        self.ensure_writable_token()?;
+        if let FeatureCheck::ReadOnly(unknown) = self.metadata.check_compatible::<ObjectID>()? {
+            bail!("repository has unknown read-only-compatible features: {unknown:?}");
+        }
+
+        match flock(&self.repository, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(e) => {
+                let err = if e == Errno::WOULDBLOCK {
+                    anyhow::anyhow!("repository is in use by another handle or process")
+                } else {
+                    anyhow::Error::new(e).context("Acquiring exclusive lock")
+                };
+                // Lock conversion is not atomic: the kernel drops our
+                // shared lock before failing, so take it back.
+                if let Err(relock_err) = flock(&self.repository, FlockOperation::LockShared) {
+                    log::warn!("Restoring shared lock: {relock_err}");
+                }
+                return Err(err);
+            }
+        }
+        let result = self.persist_insecure_locked();
+        let relock =
+            flock(&self.repository, FlockOperation::LockShared).context("Restoring shared lock");
+        match (result, relock) {
+            (Err(e), Err(relock_err)) => {
+                log::warn!("{relock_err:#}");
+                Err(e)
+            }
+            (result, relock) => result.and(relock),
+        }
+    }
+
+    /// The part of [`persist_insecure`](Self::persist_insecure) that runs
+    /// under the exclusive lock.
+    fn persist_insecure_locked(&mut self) -> Result<()> {
+        // Re-read under the lock: converting the lock isn't atomic, so
+        // another process may have rewritten meta.json meanwhile.
+        let (data, on_disk, has_verity) = Self::read_and_probe_metadata_bytes(&self.repository)?;
+        if has_verity {
+            ensure!(
+                on_disk == self.metadata,
+                "meta.json changed since the repository was opened"
+            );
+            // Write back the exact bytes rather than re-serializing, so
+            // fields this version doesn't know about are preserved.
+            replace_repo_metadata_insecure(&self.repository, &data)?;
+        }
+        self.insecure = true;
+        Ok(())
+    }
+
+    /// Whether `meta.json` currently has fs-verity enabled on disk.
+    fn metadata_has_verity(&self) -> Result<bool> {
+        let (_, has_verity) = Self::read_and_probe_metadata(&self.repository)?;
+        Ok(has_verity)
     }
 
     /// Require that this repository has fs-verity enabled.
@@ -5745,6 +5906,177 @@ mod tests {
             RepoMetadata::from_json(&std::fs::read(proc_self_fd(&fd))?)?,
             meta
         );
+        Ok(())
+    }
+
+    // ---- persist_insecure tests ----
+    //
+    // Secure repositories need fs-verity on the test tempdir, like the tests
+    // in `fsverity::tests`; `init_path` fails loudly if it's unsupported
+    // (set $CFS_TEST_TMPDIR to a verity-capable filesystem).
+
+    /// Whether `meta.json` in the repository at `path` has fs-verity enabled.
+    fn meta_json_has_verity(path: &Path) -> Result<bool> {
+        let fd = openat(
+            CWD,
+            path.join(REPO_METADATA_FILENAME),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(measure_verity_opt::<Sha512HashValue>(&fd)?.is_some())
+    }
+
+    /// Whether some handle holds a lock on the repository directory at `path`.
+    fn repo_is_locked(path: &Path) -> Result<bool> {
+        let fd = openat(CWD, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+        match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(false),
+            Err(Errno::WOULDBLOCK) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[test]
+    fn test_persist_insecure() -> Result<()> {
+        // (initially insecure, expect meta.json to be rewritten)
+        for (insecure, rewritten) in [(false, true), (true, false)] {
+            let tmp = tempdir();
+            let path = tmp.path().join("repo");
+            let config = RepositoryConfig::new(Algorithm::SHA512);
+            let config = if insecure {
+                config.set_insecure()
+            } else {
+                config
+            };
+            let (mut repo, _) = Repository::<Sha512HashValue>::init_path(CWD, &path, config)?;
+            assert_eq!(repo.is_insecure(), insecure);
+            assert_eq!(meta_json_has_verity(&path)?, !insecure);
+
+            let data = generate_test_data(64 * 1024, 0x5A);
+            let obj_id = repo.ensure_object(&data)?;
+            let image = make_test_fs(&obj_id, data.len() as u64).commit_image(&repo, None)?;
+            let meta_before = repo.metadata().clone();
+            let json_before = std::fs::read(path.join(REPO_METADATA_FILENAME))?;
+            let ino_before =
+                statat(CWD, path.join(REPO_METADATA_FILENAME), AtFlags::empty())?.st_ino;
+
+            repo.persist_insecure()?;
+
+            assert!(repo.is_insecure());
+            assert!(!meta_json_has_verity(&path)?);
+            let ino_after =
+                statat(CWD, path.join(REPO_METADATA_FILENAME), AtFlags::empty())?.st_ino;
+            assert_eq!(ino_after != ino_before, rewritten);
+            let json_after = std::fs::read(path.join(REPO_METADATA_FILENAME))?;
+            assert_eq!(json_after, json_before);
+            assert_eq!(RepoMetadata::from_json(&json_after)?, meta_before);
+            // No leftover temporary files next to meta.json.
+            let entries: Vec<String> = std::fs::read_dir(&path)?
+                .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<_>>()?;
+            assert!(
+                entries.iter().all(|e| !e.starts_with(".meta.json")),
+                "unexpected entries: {entries:?}"
+            );
+
+            // The handle keeps its shared lock and remains usable.
+            assert!(repo_is_locked(&path)?);
+            assert_eq!(repo.read_object(&obj_id)?, data);
+            repo.open_image(&image.to_hex())?;
+            repo.ensure_object(&generate_test_data(1024, 0xA5))?;
+            drop(repo);
+            assert!(!repo_is_locked(&path)?);
+
+            // A fresh open detects insecure mode from disk.
+            let repo = Repository::<Sha512HashValue>::open_path(CWD, &path)?;
+            assert!(repo.is_insecure());
+            assert_eq!(repo.metadata(), &meta_before);
+            assert_eq!(repo.read_object(&obj_id)?, data);
+            repo.open_image(&image.to_hex())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_persist_insecure_fails_when_repo_in_use() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+        let (mut repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::new(Algorithm::SHA512),
+        )?;
+        assert!(!repo.is_insecure());
+
+        // A second, independently opened handle holds its own shared lock.
+        let other = Repository::<Sha512HashValue>::open_path(CWD, &path)?;
+        let err = repo.persist_insecure().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("in use by another handle"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!repo.is_insecure());
+        assert!(meta_json_has_verity(&path)?);
+
+        // The failed attempt must not have lost this handle's shared lock.
+        drop(other);
+        assert!(repo_is_locked(&path)?);
+
+        repo.persist_insecure()?;
+        assert!(repo.is_insecure());
+        assert!(!meta_json_has_verity(&path)?);
+        Ok(())
+    }
+
+    /// Atomically replace `meta.json` in the repository at `path` with
+    /// `data`, with fs-verity enabled (i.e. keeping the repository secure).
+    fn replace_meta_json_with_verity(path: &Path, data: &[u8]) -> Result<()> {
+        let tmp = path.join("meta.json.new");
+        std::fs::write(&tmp, data)?;
+        let fd = openat(CWD, &tmp, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+        crate::fsverity::enable_verity_with_retry::<Sha512HashValue>(&fd)?;
+        std::fs::rename(&tmp, path.join(REPO_METADATA_FILENAME))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_persist_insecure_rereads_meta_json() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+        let (mut repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::new(Algorithm::SHA512),
+        )?;
+
+        // Change meta.json behind the handle's back, adding a compatible
+        // feature and a top-level field this version doesn't know about.
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(REPO_METADATA_FILENAME))?)?;
+        json["features"]["compatible"] = serde_json::json!(["future-feature"]);
+        json["future_field"] = serde_json::json!(42);
+        let data = serde_json::to_vec(&json)?;
+        replace_meta_json_with_verity(&path, &data)?;
+
+        // The mismatch is detected under the exclusive lock, and the
+        // shared lock is restored afterwards.
+        let err = repo.persist_insecure().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("meta.json changed"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!repo.is_insecure());
+        assert!(meta_json_has_verity(&path)?);
+        assert!(repo_is_locked(&path)?);
+        drop(repo);
+
+        // A handle that has seen the new metadata succeeds, and writes
+        // back the exact bytes including the unknown field.
+        let mut repo = Repository::<Sha512HashValue>::open_path(CWD, &path)?;
+        repo.persist_insecure()?;
+        assert!(repo.is_insecure());
+        assert!(!meta_json_has_verity(&path)?);
+        assert_eq!(std::fs::read(path.join(REPO_METADATA_FILENAME))?, data);
         Ok(())
     }
 
