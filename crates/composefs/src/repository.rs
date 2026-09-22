@@ -101,7 +101,7 @@ use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
         Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
-        StatVfsMountFlags, accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat,
+        StatVfsMountFlags, accessat, flock, fstatvfs, fsync, linkat, mkdirat, openat, readlinkat,
         renameat_with, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
@@ -574,22 +574,26 @@ pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetad
 
 /// Enable fs-verity on an fd, dispatching to the correct hash type
 /// based on the [`Algorithm`].
+///
+/// Like [`enable_verity_maybe_copy`], returns `Some` with an anonymous
+/// copy (which has verity enabled instead of `fd`) if the file was still
+/// open for writing somewhere.
 fn enable_verity_for_algorithm(
     dirfd: &impl AsFd,
     fd: BorrowedFd,
     algorithm: &Algorithm,
-) -> Result<()> {
-    match algorithm {
+) -> Result<Option<OwnedFd>> {
+    let copy = match algorithm {
         Algorithm::Sha256 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
-                .context("enabling verity (sha256)")?;
+                .context("enabling verity (sha256)")?
         }
         Algorithm::Sha512 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
-                .context("enabling verity (sha512)")?;
+                .context("enabling verity (sha512)")?
         }
-    }
-    Ok(())
+    };
+    Ok(copy)
 }
 
 /// Remove algorithm-specific data from a repository directory.
@@ -638,11 +642,14 @@ fn repo_format_config_from_meta(meta: &RepoMetadata) -> FormatConfig {
 }
 
 /// Write the serialized `meta` into `file`, fsync it, and return a
-/// read-only fd for the same inode.
+/// read-only fd for the written contents.
 ///
 /// If `enable_verity` is true, fs-verity is enabled on the returned fd;
 /// this is what marks a repository as requiring verity on all objects
-/// (see [`Repository::open_path`]).
+/// (see [`Repository::open_path`]).  The returned fd then may refer to
+/// an anonymous copy rather than the inode of `file`, if that couldn't
+/// have verity enabled because it was still open for writing (e.g.
+/// inherited by a process forked concurrently in another thread).
 fn write_repo_metadata_file(
     repo_fd: &impl AsFd,
     mut file: File,
@@ -653,11 +660,18 @@ fn write_repo_metadata_file(
     file.write_all(&data).context("writing metadata")?;
     file.sync_all().context("syncing metadata")?;
     let ro_fd = reopen_tmpfile_ro(file).context("re-opening metadata read-only")?;
-    if enable_verity {
-        enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-            .context("enabling verity on meta.json")?;
+    if !enable_verity {
+        return Ok(ro_fd);
     }
-    Ok(ro_fd)
+    match enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+        .context("enabling verity on meta.json")?
+    {
+        None => Ok(ro_fd),
+        Some(copy) => {
+            fsync(&copy).context("syncing metadata copy")?;
+            Ok(copy)
+        }
+    }
 }
 
 /// Write `meta.json` into a repository directory fd.
@@ -704,6 +718,8 @@ pub(crate) fn write_repo_metadata(
                 Mode::from_raw_mode(0o644),
             )
             .context("creating meta.json")?;
+            // Making a verity copy needs O_TMPFILE, which is unsupported
+            // here, so verity is always enabled in place on this path.
             write_repo_metadata_file(repo_fd, File::from(fd), meta, enable_verity)?;
         }
         Err(e) => {
@@ -5697,6 +5713,39 @@ mod tests {
             Repository::<Sha256HashValue>::open_path(CWD, &path),
             Err(RepositoryOpenError::AlgorithmMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_write_repo_metadata_file_verity_on_copy() -> Result<()> {
+        // A second writable fd on the inode (as a concurrently forked
+        // child would hold) makes enabling verity in place fail, so the
+        // verity must end up on the returned copy rather than being lost.
+        let tmp = tempdir();
+        let dir = openat(
+            CWD,
+            tmp.path(),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(openat(
+            &dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?);
+        let _writer = rustix::fs::open(
+            proc_self_fd(&file),
+            OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        let fd = write_repo_metadata_file(&dir, file, &meta, true)?;
+        assert!(measure_verity_opt::<Sha512HashValue>(&fd)?.is_some());
+        assert_eq!(
+            RepoMetadata::from_json(&std::fs::read(proc_self_fd(&fd))?)?,
+            meta
+        );
+        Ok(())
     }
 
     // ---- RepoMetadata / FeatureFlags tests ----
