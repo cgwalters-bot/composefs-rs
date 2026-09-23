@@ -186,28 +186,30 @@ jobs:
         set -eux
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
         echo 'KERNEL=="vhost-vsock", GROUP="kvm", MODE="0666", OPTIONS+="static_node=vhost-vsock"' | sudo tee /etc/udev/rules.d/99-vhost-vsock.rules
+        # 26.04 does not load vhost_vsock at boot, and udev only applies the
+        # rule to /dev/vhost-vsock once the module has registered the device.
+        sudo modprobe vhost_vsock
         sudo udevadm control --reload-rules
         sudo udevadm trigger --settle
         ls -l /dev/kvm /dev/vhost-vsock
 
     - name: Install dependencies
       run: |
-        echo 'deb-src http://azure.archive.ubuntu.com/ubuntu noble main' | sudo tee /etc/apt/sources.list.d/debsrc.list
-
         sudo apt-get update
         sudo apt-get install -y \
           erofs-utils \
           fsverity \
           mtools \
+          podman \
           python3-pytest-asyncio \
-          qemu-kvm \
-          systemd-boot-efi
+          qemu-system-x86 \
+          qemu-utils \
+          systemd-boot-efi \
+          systemd-repart
 
-    - name: Get a newer podman for heredoc support (from plucky)
-      run: |
-        echo 'deb http://azure.archive.ubuntu.com/ubuntu plucky universe main' | sudo tee /etc/apt/sources.list.d/plucky.list
-        sudo apt update
-        sudo apt install -y crun/plucky podman/plucky
+    - name: Get OS identifier
+      id: os
+      run: echo "id=$(. /etc/os-release && echo "${ID}-${VERSION_ID}")" >> "$GITHUB_OUTPUT"
 
     - uses: actions/checkout@v7
 
@@ -215,13 +217,20 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/bin
-        key: patched-tools-bin-${{ hashFiles('examples/common/install-patched-tools') }}
+        key: patched-tools-bin-${{ steps.os.outputs.id }}-${{ hashFiles('examples/common/install-patched-tools') }}
 
     - name: Ensure patched tools are installed
       run: |
         set -eux
         if [ ! -x "$HOME/bin/mkfs.ext4" ]; then
-          sudo apt-get build-dep systemd e2fsprogs
+          # build-dep needs source indexes for the running release
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          if ! grep -q '^Types: deb deb-src$' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "error: failed to enable deb-src in /etc/apt/sources.list.d/ubuntu.sources" >&2
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get build-dep -y e2fsprogs
           mkdir ~/bin
           examples/common/install-patched-tools ~/bin
         fi

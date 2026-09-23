@@ -4,16 +4,22 @@ set -eux
 
 install_path="$1"
 
-git clone https://github.com/systemd/systemd
-(
-	cd systemd
-	git checkout v258
-	meson setup _build
-	ninja -C _build systemd-repart
-	mkdir -p "${install_path}/src/shared"
-	cp _build/systemd-repart "${install_path}"
-	cp _build/src/shared/*.so "${install_path}/src/shared"
-)
+# systemd-repart gained fs-verity support in v258 (same check as
+# check-config).  Only build it when the host's version lacks it: newer
+# distributions ship a capable one, and v258 itself no longer builds
+# against their toolchains.
+if ! grep -sq 'fsverity=' "$(command -v systemd-repart)"; then
+	git clone https://github.com/systemd/systemd
+	(
+		cd systemd
+		git checkout v258
+		meson setup _build
+		ninja -C _build systemd-repart
+		mkdir -p "${install_path}/src/shared"
+		cp _build/systemd-repart "${install_path}"
+		cp _build/src/shared/*.so "${install_path}/src/shared"
+	)
+fi
 
 git clone https://github.com/tytso/e2fsprogs
 (
