@@ -57,6 +57,17 @@ pub(crate) fn cfsctl() -> Result<PathBuf> {
     )
 }
 
+/// Returns true if skopeo is available on the system.
+pub(crate) fn have_skopeo() -> bool {
+    std::process::Command::new("skopeo")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Bind a listening Unix socket at a fresh tempdir path and spawn `cfsctl`
 /// against it via the systemd socket-activation protocol (`LISTEN_FDS=1`, the
 /// listening socket on fd 3, `LISTEN_PID` set in the child). The socket is

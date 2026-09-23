@@ -414,6 +414,11 @@ enum OciCommand {
         /// import path with zero-copy reflink/hardlink support.
         #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
         local_fetch: LocalFetchCli,
+        /// Number of times to retry transient registry failures (network
+        /// errors and timeouts, HTTP 5xx and 429, truncated blobs), with
+        /// exponential backoff; 0 disables retrying. Defaults to 3.
+        #[arg(long, value_name = "N")]
+        retry: Option<u32>,
     },
     /// Copy an OCI image (and its layers) from another composefs repository
     /// into this repository.
@@ -1834,6 +1839,7 @@ where
                 bootable,
                 expected_digest,
                 local_fetch,
+                retry,
             } => {
                 // Parse before pulling so a malformed digest fails fast,
                 // rather than after a potentially long-running fetch.
@@ -1859,6 +1865,9 @@ where
                     local_fetch: local_fetch.into(),
                     progress: Some(reporter),
                     bootable: use_bootable_opt,
+                    retry: retry
+                        .map(composefs_oci::RetryPolicy::with_max_retries)
+                        .unwrap_or_default(),
                     ..Default::default()
                 };
 
