@@ -47,7 +47,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use composefs_ctl::varlink::oci::{OciError, OciInspectReply, PullProgress};
 use composefs_ctl::varlink::proxy::{OciProxy, RepositoryProxy};
-use composefs_ctl::varlink::{ImageObjectsReply, InitRepositoryReply, RepositoryError};
+use composefs_ctl::varlink::{
+    ImageObjectsReply, InitRepositoryReply, OpenRepositoryReply, RepositoryError,
+};
 use serde_json::{Value, json};
 use xshell::{Shell, cmd};
 use zlink::futures_util::TryStreamExt;
@@ -249,6 +251,19 @@ impl VarlinkService {
         self.rt.block_on(async {
             let mut conn = self.connect().await?;
             conn.init_repository(path, algorithm, insecure).await
+        })
+    }
+
+    /// `org.composefs.Repository.OpenRepository` via the typed proxy.
+    fn proxy_open_repository(
+        &self,
+        path: Option<&str>,
+        user: Option<bool>,
+        system: Option<bool>,
+    ) -> zlink::Result<Result<OpenRepositoryReply, RepositoryError>> {
+        self.rt.block_on(async {
+            let mut conn = self.connect().await?;
+            conn.open_repository(path, user, system).await
         })
     }
 
@@ -1186,11 +1201,18 @@ fn test_varlink_open_repository_invalid_spec() -> Result<()> {
 
     let svc = VarlinkService::repository(repo)?;
 
-    // No selector field at all.
-    let err = svc.call_expect_err("org.composefs.Repository.OpenRepository", json!({}))?;
+    // No selector field at all. This goes through the typed proxy rather
+    // than `varlinkctl`: since systemd v259, sd-varlink (and so
+    // `varlinkctl`) omits an empty `parameters` object entirely, and
+    // zlink's server cannot deserialize a call without `parameters` into a
+    // method that takes (all-optional) parameters, so it drops the
+    // connection instead of replying.
+    let err = svc
+        .proxy_open_repository(None, None, None)?
+        .expect_err("OpenRepository without a selector should fail");
     assert!(
-        err.contains("InvalidSpec"),
-        "expected InvalidSpec for empty params, got: {err}"
+        matches!(err, RepositoryError::InvalidSpec { .. }),
+        "expected InvalidSpec for empty params, got: {err:?}"
     );
 
     // Two selector fields simultaneously.
