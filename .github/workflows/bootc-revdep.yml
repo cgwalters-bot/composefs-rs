@@ -1,11 +1,9 @@
 name: bootc Reverse Dependency CI
 
+# Automatic triggers (push, pull_request, merge_group) are disabled until
+# bootc main is adapted to the current composefs-rs API; see the
+# COMPOSEFS_BOOTC_REF TODO below. Restore them when re-enabling.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  merge_group:
   workflow_dispatch: {}
 
 env:
@@ -22,7 +20,6 @@ permissions:
 jobs:
   bootc-test:
     name: Build and test bootc with local composefs-rs
-    if: never()
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
