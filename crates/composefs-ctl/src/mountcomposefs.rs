@@ -105,8 +105,8 @@ fn parse_mount_options(options: &str) -> Vec<ParsedOption> {
 }
 
 fn run_mount(args: impl IntoIterator<Item = OsString>) -> Result<()> {
-    let cli =
-        MountArgs::try_parse_from(std::iter::once(OsString::from("mount.composefs")).chain(args))?;
+    let cli: MountArgs =
+        crate::parse_c_compat_args(std::iter::once(OsString::from("mount.composefs")).chain(args));
 
     if let Some(ref fstype) = cli.fstype
         && fstype != "composefs"
@@ -167,11 +167,14 @@ fn run_mount(args: impl IntoIterator<Item = OsString>) -> Result<()> {
         }
     };
 
+    // Like C, reject an empty entry (`basedir=`, `a::b`, `:a`, `a:`) rather
+    // than skipping it: a typo must not silently drop an object directory.
+    if basedir_str.split(':').any(str::is_empty) {
+        bail!("Value for basedir option has incorrect format");
+    }
+
     let mut basedir_fds: Vec<OwnedFd> = Vec::new();
     for dir in basedir_str.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
         let fd = rustix::fs::open(
             dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -179,9 +182,6 @@ fn run_mount(args: impl IntoIterator<Item = OsString>) -> Result<()> {
         )
         .with_context(|| format!("Failed to open basedir {dir}"))?;
         basedir_fds.push(fd);
-    }
-    if basedir_fds.is_empty() {
-        bail!("No object dirs specified");
     }
 
     match (&opt_upperdir, &opt_workdir) {

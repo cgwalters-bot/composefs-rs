@@ -10,7 +10,9 @@ header: User Commands
 composefs-info - print information about a composefs image
 
 # SYNOPSIS
-**composefs-info** [ls|objects|missing-objects|dump] *IMAGE* [*IMAGE2* *IMAGE3* ...]
+**composefs-info** [*OPTIONS*] ls|objects|missing-objects|dump *IMAGE* [*IMAGE2* *IMAGE3* ...]
+
+**composefs-info** measure-file *FILE* [*FILE2* ...]
 
 # DESCRIPTION
 
@@ -41,22 +43,31 @@ several sub-commands:
 
 # OPTIONS
 
-The provided *IMAGE* argument must be a composefs file. Multiple images
+The provided *IMAGE* argument must be a composefs file. At least one
+image (or, for **measure-file**, one file) is required, and multiple
 can be specified.
 
-**compoosefs-info** accepts the following options:
+**composefs-info** accepts the following options, before or after the
+sub-command:
 
 
 **\-\-basedir**=*PATH*
 :   This should point to a directory of backing files, and will be used
     by the **missing-objects** command to know what files are available.
+    It is required by **missing-objects**.
 
 **\-\-filter**=*NAME*
-:   Only print entries whose name matches one of these. Can be specified
+:   Only load the top-level entries whose name matches one of these,
+    for every sub-command that reads images. Can be specified
     multiple times. Cannot be a full path (e.g. cannot contain `/`).
     This is intended to be used for tooling to efficiently lookup metadata
     files embedded in the image without loading and printing the entire
     image.
+
+# EXIT STATUS
+
+**composefs-info** exits 0 on success and 1 on any error, including
+invalid command-line arguments and a missing *IMAGE* or *FILE*.
 
 # SEE ALSO
 **composefs-info(1)**, **composefs-dump(5)**

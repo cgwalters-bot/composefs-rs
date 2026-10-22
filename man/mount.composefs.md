@@ -11,7 +11,7 @@ mount.composefs - mount a composefs filesystem image
 
 # SYNOPSIS
 
-**mount.composefs** [-o OPTIONS] *IMAGE* *TARGETDIR*
+**mount.composefs** [-h] [-t composefs] [-o OPTIONS] *IMAGE* *TARGETDIR*
 
 # DESCRIPTION
 
@@ -28,15 +28,23 @@ as a mount helper by running `mount -t composefs ...`.
 The provided *IMAGE* argument must be a valid composefs (EROFS)
 metadata image.  The *TARGETDIR* will be used as a mount target.
 
-**mount.composefs** accepts the following colon-separated mount
+**-h**
+:   Print a help message and exit.
+
+**-t** *TYPE*
+:   The filesystem type; only `composefs` is accepted.
+
+**mount.composefs** accepts the following comma-separated mount
 options when passed via the `-o OPTIONS` argument.
 
-**basedir**=*PATH*
+**basedir**=*PATH*[:*PATH*...]
 :   This path will be used to resolve non-empty file references
     stored in the composefs metadata image.  A primary use case is to have
     this be the same path provided to `mkcomposefs --digest-store=PATH`.
+    This option is required.
 
-    Multiple paths can be specified, separated by `:`.
+    Multiple paths can be specified, separated by `:`. An empty path
+    (as in `basedir=`, `a::b`, `:a` or `a:`) is an error.
 
 **digest**=*DIGEST*
 :   The image file is validated to have the specified fs-verity digest
@@ -70,6 +78,11 @@ options when passed via the `-o OPTIONS` argument.
 
 **workdir**
 :  Specifies an overlayfs workdir to go with **upperdir**.
+
+# EXIT STATUS
+
+**mount.composefs** exits 0 on success, including for **-h**, and 1 on
+any error, including invalid command-line arguments.
 
 # SEE ALSO
 

@@ -83,6 +83,22 @@ use composefs::{
     tree::RegularFile,
 };
 
+/// Parse the command line of a composefs-c compatible tool.
+///
+/// The C `mkcomposefs`, `composefs-info` and `mount.composefs` exit 1 on any
+/// usage error, and callers (including composefs-c's own test suite, which
+/// requires exactly 1) depend on that; clap's default is 2.  Requests for
+/// help or the version still exit 0.
+pub(crate) fn parse_c_compat_args<T: Parser>(
+    argv: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+) -> T {
+    T::try_parse_from(argv).unwrap_or_else(|e| {
+        let code = if e.use_stderr() { 1 } else { 0 };
+        let _ = e.print();
+        std::process::exit(code)
+    })
+}
+
 /// An `indicatif`-backed [`ProgressReporter`] for use in the CLI.
 ///
 /// Renders per-component progress bars via [`MultiProgress`].  When a component

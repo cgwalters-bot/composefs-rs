@@ -42,6 +42,16 @@ use composefs::{
     about = "Query information from composefs images"
 )]
 struct Cli {
+    /// Only load the top-level entries with this name (can be repeated).
+    ///
+    /// Applies to every command that reads images, as in C composefs-info.
+    #[arg(long, global = true, value_name = "NAME", value_parser = parse_filter)]
+    filter: Vec<String>,
+
+    /// Base directory for object lookups (used by missing-objects).
+    #[arg(long, global = true, value_name = "PATH")]
+    basedir: Option<PathBuf>,
+
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
@@ -52,47 +62,51 @@ struct Cli {
 enum Command {
     /// Simple listing of files and directories in the image.
     Ls {
-        /// Filter entries at the root level by name (can be specified multiple times).
-        #[arg(long = "filter", action = clap::ArgAction::Append)]
-        filter: Vec<String>,
         /// Composefs image files to inspect.
+        #[arg(required = true)]
         images: Vec<PathBuf>,
     },
 
     /// Full dump in composefs-dump(5) format.
     Dump {
-        /// Filter entries at the root level by name (can be specified multiple times).
-        #[arg(long = "filter", action = clap::ArgAction::Append)]
-        filter: Vec<String>,
         /// Composefs image files to dump.
+        #[arg(required = true)]
         images: Vec<PathBuf>,
     },
 
     /// List all backing file object paths.
     Objects {
         /// Composefs image files to inspect.
+        #[arg(required = true)]
         images: Vec<PathBuf>,
     },
 
     /// List backing files not present in basedir.
     MissingObjects {
-        /// Base directory for object lookups.
-        #[arg(long = "basedir", required = true)]
-        basedir: PathBuf,
         /// Composefs image files to inspect.
+        #[arg(required = true)]
         images: Vec<PathBuf>,
     },
 
     /// Print the fs-verity digest of files.
     MeasureFile {
         /// Files to measure.
+        #[arg(required = true)]
         files: Vec<PathBuf>,
     },
 }
 
+/// A filter names a single top-level entry, so it may not contain `/`.
+fn parse_filter(s: &str) -> Result<String, String> {
+    if s.contains('/') {
+        return Err(format!("Filter must be a single name: {s}"));
+    }
+    Ok(s.to_owned())
+}
+
 /// Entry point for the composefs-info multi-call mode.
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = crate::parse_c_compat_args(std::env::args_os());
     run_with_cli(cli)
 }
 
@@ -100,21 +114,30 @@ pub fn run() -> Result<()> {
 ///
 /// `extra_args` contains everything after the `composefs-info` token as
 /// captured by clap's trailing-var-arg mechanism.  A synthetic `argv[0]` is
-/// prepended so that `Cli::parse_from` produces the same help text / error
+/// prepended so that parsing produces the same help text / error
 /// messages as the standalone binary.
 pub fn run_from_args(extra_args: Vec<std::ffi::OsString>) -> Result<()> {
     let mut argv = vec![std::ffi::OsString::from("composefs-info")];
     argv.extend(extra_args);
-    let cli = Cli::parse_from(argv);
+    let cli = crate::parse_c_compat_args(argv);
     run_with_cli(cli)
 }
 
 fn run_with_cli(cli: Cli) -> Result<()> {
+    let filter = &cli.filter;
     match &cli.command {
-        Command::Ls { filter, images } => cmd_ls(filter, images),
-        Command::Dump { filter, images } => cmd_dump(filter, images),
-        Command::Objects { images } => cmd_objects(images),
-        Command::MissingObjects { basedir, images } => cmd_missing_objects(basedir, images),
+        Command::Ls { images } => cmd_ls(filter, images),
+        Command::Dump { images } => cmd_dump(filter, images),
+        Command::Objects { images } => cmd_objects(filter, images),
+        Command::MissingObjects { images } => {
+            // C composefs-info treats a missing --basedir as "every object is
+            // missing" only by accident (it stats against fd 0); require it.
+            let basedir = cli
+                .basedir
+                .as_deref()
+                .context("missing-objects requires --basedir")?;
+            cmd_missing_objects(basedir, filter, images)
+        }
         Command::MeasureFile { files } => cmd_measure_file(files),
     }
 }
@@ -142,19 +165,9 @@ fn ls_print<W: Write>(
     dir: &composefs::tree::Directory<Sha256HashValue>,
     path: &[u8],
     seen_leaf_ids: &mut HashSet<LeafId>,
-    filter: Option<&[String]>,
 ) -> Result<()> {
     for (name, child) in dir.sorted_entries() {
         let name_bytes = name.as_encoded_bytes();
-
-        if let Some(filter) = filter
-            && !filter.is_empty()
-        {
-            let name_str = name.to_string_lossy();
-            if !filter.iter().any(|f| f == name_str.as_ref()) {
-                continue;
-            }
-        }
 
         let mut child_path = path.to_vec();
         child_path.push(b'/');
@@ -167,7 +180,7 @@ fn ls_print<W: Write>(
                 write!(out, "/\t")?;
                 writeln!(out)?;
                 // Recurse into the directory.
-                ls_print(out, fs, child_dir, &child_path, seen_leaf_ids, None)?;
+                ls_print(out, fs, child_dir, &child_path, seen_leaf_ids)?;
             }
             Inode::Leaf(leaf_id, _) => {
                 let leaf = fs.leaf(*leaf_id);
@@ -196,25 +209,31 @@ fn ls_print<W: Write>(
     Ok(())
 }
 
+/// Load an image, keeping only the top-level entries named in `filter`.
+///
+/// An empty filter keeps everything.  This mirrors C's `toplevel_entries`
+/// load option, so the filter applies equally to every image command.
+fn load_image(image_path: &PathBuf, filter: &[String]) -> Result<FileSystem<Sha256HashValue>> {
+    let image_data = read_image(image_path)?;
+    let mut fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
+        .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
+    if !filter.is_empty() {
+        fs.root
+            .retain_top_level(|name| filter.iter().any(|f| f == name));
+        fs.compact();
+    }
+    Ok(fs)
+}
+
 /// List files and directories in the image.
 fn cmd_ls(filter: &[String], images: &[PathBuf]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     for image_path in images {
-        let image_data = read_image(image_path)?;
-        let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
-            .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
-
+        let fs = load_image(image_path, filter)?;
         let mut seen_leaf_ids = HashSet::new();
-        ls_print(
-            &mut out,
-            &fs,
-            &fs.root,
-            b"",
-            &mut seen_leaf_ids,
-            Some(filter),
-        )?;
+        ls_print(&mut out, &fs, &fs.root, b"", &mut seen_leaf_ids)?;
     }
 
     Ok(())
@@ -224,14 +243,12 @@ fn cmd_ls(filter: &[String], images: &[PathBuf]) -> Result<()> {
 ///
 /// This matches the C composefs-info dump output: the EROFS image is parsed
 /// back into a filesystem tree which is then serialized as a dumpfile.
-fn cmd_dump(_filter: &[String], images: &[PathBuf]) -> Result<()> {
+fn cmd_dump(filter: &[String], images: &[PathBuf]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     for image_path in images {
-        let image_data = read_image(image_path)?;
-        let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
-            .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
+        let fs = load_image(image_path, filter)?;
         write_dumpfile(&mut out, &fs)
             .with_context(|| format!("Failed to dump image: {image_path:?}"))?;
     }
@@ -256,12 +273,9 @@ fn collect_objects_from_fs(fs: &FileSystem<Sha256HashValue>) -> HashSet<Sha256Ha
 }
 
 /// List all object paths from the images.
-fn cmd_objects(images: &[PathBuf]) -> Result<()> {
+fn cmd_objects(filter: &[String], images: &[PathBuf]) -> Result<()> {
     for image_path in images {
-        let image_data = read_image(image_path)?;
-        let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
-            .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
-
+        let fs = load_image(image_path, filter)?;
         let mut objects: Vec<Sha256HashValue> = collect_objects_from_fs(&fs).into_iter().collect();
         objects.sort_by_key(|id| id.to_hex());
 
@@ -273,13 +287,11 @@ fn cmd_objects(images: &[PathBuf]) -> Result<()> {
 }
 
 /// List objects not present in basedir.
-fn cmd_missing_objects(basedir: &Path, images: &[PathBuf]) -> Result<()> {
+fn cmd_missing_objects(basedir: &Path, filter: &[String], images: &[PathBuf]) -> Result<()> {
     let mut all_objects: HashSet<Sha256HashValue> = HashSet::new();
 
     for image_path in images {
-        let image_data = read_image(image_path)?;
-        let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
-            .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
+        let fs = load_image(image_path, filter)?;
         all_objects.extend(collect_objects_from_fs(&fs));
     }
 

@@ -43,6 +43,7 @@ use composefs::{
         read_filesystem_with_opts,
     },
     fsverity::{FsVerityHashValue, Sha256HashValue, compute_verity},
+    generic_tree::LeafContent,
     tree::FileSystem,
 };
 
@@ -85,13 +86,13 @@ struct Args {
     #[arg(long)]
     user_xattrs: bool,
 
-    /// Minimum image format version to use (0 or 1).
-    #[arg(long, default_value = "0")]
-    min_version: u32,
+    /// Minimum image format version to use (0 or 1, default 0).
+    #[arg(long)]
+    min_version: Option<u32>,
 
-    /// Maximum image format version (for auto-upgrade).
-    #[arg(long, default_value = "1")]
-    max_version: u32,
+    /// Maximum image format version, for auto-upgrade (0 or 1, default 1).
+    #[arg(long)]
+    max_version: Option<u32>,
 
     /// Copy regular file content to the given object store directory.
     ///
@@ -109,7 +110,9 @@ struct Args {
     hardlinks: bool,
 
     /// Number of threads to use for digest calculation and file copying.
-    #[arg(long)]
+    ///
+    /// Must be at least 1, as in C mkcomposefs.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     threads: Option<usize>,
 
     /// The source directory or dumpfile.
@@ -123,7 +126,7 @@ struct Args {
 
 /// Entry point for the mkcomposefs multi-call mode.
 pub fn run() -> Result<()> {
-    let args = Args::parse();
+    let args = crate::parse_c_compat_args(std::env::args_os());
     run_with_args(args)
 }
 
@@ -131,12 +134,12 @@ pub fn run() -> Result<()> {
 ///
 /// `extra_args` contains everything after the `mkcomposefs` token as captured
 /// by clap's trailing-var-arg mechanism.  A synthetic `argv[0]` is prepended
-/// so that `Args::parse_from` produces the same help text / error messages as
+/// so that parsing produces the same help text / error messages as
 /// the standalone binary.
 pub fn run_from_args(extra_args: Vec<std::ffi::OsString>) -> Result<()> {
     let mut argv = vec![std::ffi::OsString::from("mkcomposefs")];
     argv.extend(extra_args);
-    let args = Args::parse_from(argv);
+    let args = crate::parse_c_compat_args(argv);
     run_with_args(args)
 }
 
@@ -150,33 +153,25 @@ fn run_with_args(args: Args) -> Result<()> {
         bail!("IMAGE is required (or use --print-digest-only)");
     }
 
-    if args.min_version > args.max_version {
-        bail!(
-            "Invalid version range: --min-version ({}) must not exceed --max-version ({})",
-            args.min_version,
-            args.max_version
-        );
-    }
-
     // The C composefs tool supports only versions 0 and 1 (LCFS_VERSION_MAX=1).
     // Both use the same C-compatible on-disk format (compact inodes, BFS, whiteout
     // table).  The difference is in the `composefs_version` EROFS header field:
-    //   - version 0 (default): starts at 0, auto-upgrades to 1 if a user-visible
-    //     whiteout device (chr 0,0) is encountered.
+    //   - version 0: written as 0, but upgraded to 1 when the tree has a
+    //     user-visible whiteout device (chr 0,0) and max_version allows it.
     //   - version 1: always writes composefs_version=1 regardless of content.
     // Versions > 1 are not defined by the C tool and are rejected below.
-    if args.min_version > 1 {
-        bail!(
-            "--min-version {} is not supported; the maximum C-compatible version is 1",
-            args.min_version
-        );
-    }
-    // Map C --min-version to our FormatVersion: 0 → V0 (auto-detect), 1 → V1 (always 1).
-    let format_version = if args.min_version >= 1 {
-        FormatVersion::V1
-    } else {
-        FormatVersion::V0
+    //
+    // As in C, the defaults (0 and 1) apply only when neither option is
+    // given; setting either one leaves the other at 0, and a max_version
+    // below min_version is raised to it rather than rejected.
+    let (min_version, max_version) = match (args.min_version, args.max_version) {
+        (None, None) => (0, 1),
+        (min, max) => (min.unwrap_or(0), max.unwrap_or(0)),
     };
+    if min_version > 1 || max_version > 1 {
+        bail!("Unsupported format version; the maximum C-compatible version is 1");
+    }
+    let max_version = max_version.max(min_version);
 
     // Open or create the digest store if specified.
     // Always uses the C-compatible flat layout (XX/DIGEST) so that the store
@@ -214,6 +209,20 @@ fn run_with_args(args: Args) -> Result<()> {
 
     // Apply transformations based on flags
     apply_transformations(&mut fs, &args)?;
+
+    // C's lcfs_write_update_version(): version 1 changed how whiteouts are
+    // stored, so an image with one is upgraded when max_version permits.
+    // This runs after --skip-devices has removed device nodes, as C does for
+    // directory sources (C ignores --skip-devices with --from-file).
+    let has_whiteout = fs
+        .leaves
+        .iter()
+        .any(|leaf| matches!(leaf.content, LeafContent::CharacterDevice(0)));
+    let format_version = if min_version >= 1 || (max_version >= 1 && has_whiteout) {
+        FormatVersion::V1
+    } else {
+        FormatVersion::V0
+    };
 
     // Generate EROFS image
     let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, format_version);

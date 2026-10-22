@@ -67,16 +67,18 @@ will be a mountable composefs image.
 :   The source is a file in the **composefs-dump(5)** format. If
     the specified file is "-", the data is read from stdin.
 
-**\-\-version**
-:   The base version to use for the image format.
+**\-\-min-version**=*N*
+:   The base version to use for the image format (0 or 1).
 
-**\-\-max-version**
-:   If this specifies a version higher than \-\-version, then the
+**\-\-max-version**=*N*
+:   If this specifies a version higher than \-\-min-version, then the
     actual image format version used will be adjusted upwards if that
-    is beneficial for the image, up to the max version.
+    is beneficial for the image, up to the max version (0 or 1). A
+    value below \-\-min-version is raised to it.
 
 **\-\-threads**=*count*
 :   Number of threads to be used to calculate the file digests and copy.
+    Must be at least 1.
     Default thread count is the number of processors when *--threads* is not specified.
 
 # FORMAT VERSIONING
@@ -90,7 +92,7 @@ example when a new type of file is introduced or a bug is fixed. This
 is handled by introducing a format version.
 
 Specifying the version is done with two options, the base version
-(\-\-version) and the max version (\-\-max-version). When building an
+(\-\-min-version) and the max version (\-\-max-version). When building an
 image, mkcomposefs tries to keep the image format as low as possible,
 but if some particular requested feature is not available with the
 base feature, but is accessible in the max version then the version
@@ -107,7 +109,12 @@ Format version history:
 - 1 - Supports overlay whiteout files in the image (added in 1.0.3)
 
 The default if no version arguments are specified is version 0 and max
-version 1.
+version 1. If only one of the two options is given, the other one is 0.
+
+# EXIT STATUS
+
+**mkcomposefs** exits 0 on success and 1 on any error, including
+invalid command-line arguments.
 
 # SANDBOXING RECOMMENDATIONS
 
