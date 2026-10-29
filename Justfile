@@ -170,6 +170,11 @@ fuzz-list:
 test-capi *ARGS:
     crates/composefs-capi/tests/test-capi-container.sh {{ARGS}}
 
+# Run the C composefs tests/ suites against the Rust mkcomposefs,
+# composefs-info and mount.composefs in a container.
+test-c-cli:
+    bash crates/composefs-capi/tests/test-c-cli-container.sh
+
 # Clean build artifacts
 clean:
     cargo clean
