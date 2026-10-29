@@ -27,12 +27,17 @@ pub unsafe extern "C" fn lcfs_compute_fsverity_from_data(
     data: *mut u8,
     data_len: usize,
 ) -> c_int {
-    if digest.is_null() || data.is_null() {
+    if digest.is_null() || (data.is_null() && data_len > 0) {
         set_errno(libc::EINVAL);
         return -1;
     }
 
-    let input = unsafe { std::slice::from_raw_parts(data, data_len) };
+    // C accepts NULL for empty data (test-lcfs's test_fsverity_empty_file).
+    let input = if data_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_len) }
+    };
     let hash = fsverity::compute_verity::<Sha256HashValue>(input);
     copy_hash_to_digest(&hash, digest);
     0
@@ -88,7 +93,7 @@ pub unsafe extern "C" fn lcfs_compute_fsverity_from_content(
     0
 }
 
-const ENOVERITY: c_int = libc::ENOTTY;
+pub(crate) const ENOVERITY: c_int = libc::ENOTTY;
 
 fn measure_error_to_errno(e: &MeasureVerityError) -> c_int {
     match e {
@@ -217,10 +222,10 @@ pub unsafe extern "C" fn lcfs_node_set_fsverity_from_fd(node: *mut FfiNode, fd: 
     0
 }
 
-const LCFS_BUILD_COMPUTE_DIGEST: c_int = 1 << 3;
-const LCFS_BUILD_NO_INLINE: c_int = 1 << 4;
-const LCFS_BUILD_BY_DIGEST: c_int = 1 << 6;
-const LCFS_RECOMMENDED_INLINE_CONTENT_MAX: u64 = 64;
+pub(crate) const LCFS_BUILD_COMPUTE_DIGEST: c_int = 1 << 3;
+pub(crate) const LCFS_BUILD_NO_INLINE: c_int = 1 << 4;
+pub(crate) const LCFS_BUILD_BY_DIGEST: c_int = 1 << 6;
+pub(crate) const LCFS_RECOMMENDED_INLINE_CONTENT_MAX: u64 = 64;
 
 fn digest_to_path(digest: &[u8; LCFS_DIGEST_SIZE]) -> String {
     use std::fmt::Write;

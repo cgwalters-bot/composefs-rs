@@ -24,17 +24,17 @@ pub struct LcfsMountOptions {
     pub reserved2: [*mut std::ffi::c_void; 4],
 }
 
-const LCFS_MOUNT_FLAGS_REQUIRE_VERITY: u32 = 1 << 0;
-const LCFS_MOUNT_FLAGS_READONLY: u32 = 1 << 1;
-const LCFS_MOUNT_FLAGS_IDMAP: u32 = 1 << 3;
-const LCFS_MOUNT_FLAGS_TRY_VERITY: u32 = 1 << 4;
-const LCFS_MOUNT_FLAGS_MASK: u32 = (1 << 5) - 1;
+pub(crate) const LCFS_MOUNT_FLAGS_REQUIRE_VERITY: u32 = 1 << 0;
+pub(crate) const LCFS_MOUNT_FLAGS_READONLY: u32 = 1 << 1;
+pub(crate) const LCFS_MOUNT_FLAGS_IDMAP: u32 = 1 << 3;
+pub(crate) const LCFS_MOUNT_FLAGS_TRY_VERITY: u32 = 1 << 4;
+pub(crate) const LCFS_MOUNT_FLAGS_MASK: u32 = (1 << 5) - 1;
 
 /// `EWRONGVERITY` from lcfs-mount.h: the image's fs-verity digest doesn't
 /// match `expected_fsverity_digest`.
-const EWRONGVERITY: c_int = libc::EILSEQ;
+pub(crate) const EWRONGVERITY: c_int = libc::EILSEQ;
 /// `ENOVERITY` from lcfs-mount.h: the image has no fs-verity digest.
-const ENOVERITY: c_int = libc::ENOTTY;
+pub(crate) const ENOVERITY: c_int = libc::ENOTTY;
 /// Longest digest accepted in `expected_fsverity_digest`, as in C.
 const MAX_DIGEST_SIZE: usize = 64;
 

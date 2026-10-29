@@ -39,11 +39,11 @@ pub struct LcfsReadOptions {
     pub reserved2: [*mut c_void; 4],
 }
 
-const LCFS_BUILD_COMPUTE_DIGEST: u32 = 1 << 3;
-const LCFS_VERSION_MAX: u32 = 1;
+pub(crate) const LCFS_FORMAT_EROFS: u32 = 0;
+pub(crate) const LCFS_VERSION_MAX: u32 = 1;
 // All currently defined flags. The C library defines LCFS_FLAGS_MASK = 0
 // (no flags yet), so any non-zero flags value is invalid.
-const LCFS_FLAGS_MASK: u32 = 0;
+pub(crate) const LCFS_FLAGS_MASK: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lcfs_load_node_from_image(
@@ -280,31 +280,37 @@ unsafe fn write_to_inner(root: *mut FfiNode, options: *mut LcfsWriteOptions) -> 
             }
         };
 
+        if opts.format != LCFS_FORMAT_EROFS {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+
         // Generate the EROFS image
         let image_data = mkfs_erofs_versioned(&validated, version);
 
-        // Compute digest if requested
-        if opts.flags & LCFS_BUILD_COMPUTE_DIGEST != 0 && !opts.digest_out.is_null() {
-            let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image_data);
-            ptr::copy_nonoverlapping(digest.as_bytes().as_ptr(), opts.digest_out, 32);
-        }
-
-        // Write through callback
+        // Write through callback.  Like C, a callback that makes no progress
+        // fails the write, and errno is EIO unless the callback set it.
         if let Some(write_cb) = opts.file_write_cb {
             let mut offset = 0;
             while offset < image_data.len() {
                 let remaining = image_data.len() - offset;
+                set_errno(libc::EIO);
                 let written = write_cb(
                     opts.file,
                     image_data[offset..].as_ptr() as *mut c_void,
                     remaining,
                 );
-                if written < 0 {
-                    set_errno(libc::EIO);
+                if written <= 0 {
                     return -1;
                 }
                 offset += written as usize;
             }
+        }
+
+        // Like C, a digest is computed whenever there's somewhere to put it.
+        if !opts.digest_out.is_null() {
+            let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image_data);
+            ptr::copy_nonoverlapping(digest.as_bytes().as_ptr(), opts.digest_out, 32);
         }
 
         0

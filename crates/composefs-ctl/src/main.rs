@@ -19,11 +19,10 @@
 //!    BFS ordering, whiteout table, and overlay xattr escaping is complete and
 //!    tested, and is now the default for new repositories.  V2 remains
 //!    available for callers that need it.
-//! 3. **C shared library (`libcomposefs`)**: TODO(compat): Not yet started.
-//!    This is the next major milestone — providing a C-ABI compatible shared
-//!    library so that existing C consumers (e.g. ostree, bootc) can link
-//!    against the Rust implementation.  Will require `#[no_mangle]` exports,
-//!    a `cdylib` crate, and C header generation (e.g. via cbindgen).
+//! 3. **C shared library (`libcomposefs`)**: Implemented in the
+//!    `composefs-capi` crate, which builds a `libcomposefs.so.1` with C's
+//!    symbols and struct layouts (`just check-capi-abi` checks it against
+//!    C).  Some behaviour still differs; see that check's report.
 
 use std::ffi::OsStr;
 use std::path::Path;

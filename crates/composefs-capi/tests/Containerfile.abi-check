@@ -1,0 +1,9 @@
+FROM quay.io/fedora/fedora:latest
+RUN dnf -y install meson gcc pkg-config openssl-devel binutils diffutils git-core \
+    && dnf clean all
+COPY composefs-c /src/composefs-c
+COPY tests /src/tests
+COPY libcomposefs_capi.so /src/rust/libcomposefs.so.1
+WORKDIR /src/composefs-c
+RUN meson setup build && meson compile -C build
+RUN bash /src/tests/abi-check.sh /src/composefs-c /src/rust

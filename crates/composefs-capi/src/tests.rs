@@ -313,7 +313,7 @@ fn test_write_to_clamps_max_version() {
         node::lcfs_node_set_mode(root, libc::S_IFDIR | 0o755);
 
         let mut options: LcfsWriteOptions = std::mem::zeroed();
-        options.format = 1; // LCFS_FORMAT_EROFS
+        options.format = crate::image::LCFS_FORMAT_EROFS;
         options.version = 1;
         options.max_version = 0; // less than version
         options.file_write_cb = Some(null_write);
@@ -326,6 +326,58 @@ fn test_write_to_clamps_max_version() {
         );
 
         node::lcfs_node_unref(root);
+    }
+}
+
+/// lcfs_write_to must fail, like C, when the write callback makes no
+/// progress or fails, rather than retrying forever, and keep the
+/// callback's errno.
+#[test]
+fn test_write_to_fails_on_stalled_callback() {
+    use crate::image::{LcfsWriteOptions, lcfs_write_to};
+
+    // `file` points at the number of calls made so far.
+    unsafe extern "C" fn write_zero(
+        file: *mut std::ffi::c_void,
+        _buf: *mut std::ffi::c_void,
+        _count: usize,
+    ) -> isize {
+        unsafe { *(file as *mut usize) += 1 };
+        0
+    }
+
+    unsafe extern "C" fn write_enospc(
+        file: *mut std::ffi::c_void,
+        _buf: *mut std::ffi::c_void,
+        _count: usize,
+    ) -> isize {
+        unsafe {
+            *(file as *mut usize) += 1;
+            *libc::__errno_location() = libc::ENOSPC;
+        }
+        -1
+    }
+
+    type WriteCb =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> isize;
+    let cases: [(WriteCb, libc::c_int); 2] =
+        [(write_zero, libc::EIO), (write_enospc, libc::ENOSPC)];
+    for (cb, expected_errno) in cases {
+        unsafe {
+            let root = node::lcfs_node_new();
+            node::lcfs_node_set_mode(root, libc::S_IFDIR | 0o755);
+
+            let mut calls = 0usize;
+            let mut options: LcfsWriteOptions = std::mem::zeroed();
+            options.file = &mut calls as *mut usize as *mut _;
+            options.file_write_cb = Some(cb);
+
+            assert_eq!(lcfs_write_to(root, &mut options), -1);
+            assert_eq!(*libc::__errno_location(), expected_errno);
+            assert_eq!(calls, 1);
+
+            node::lcfs_node_unref(root);
+        }
     }
 }
 
@@ -391,4 +443,129 @@ fn test_clone_deep_rewrites_hardlinks() {
         node::lcfs_node_unref(cloned_root);
         node::lcfs_node_unref(root);
     }
+}
+
+/// The Rust definitions of the public structs and constants must match
+/// tests/abi-layout.txt, which `just check-capi-abi` checks against the C
+/// headers.  Every struct field there must be checked; constants the Rust
+/// library never interprets may be missing here.
+#[test]
+fn test_abi_layout_matches_c_headers() {
+    use crate::fsverity;
+    use crate::image::{self, LcfsReadOptions, LcfsWriteOptions};
+    use crate::mount::{self, LcfsMountOptions};
+    use composefs::erofs::format::{
+        COMPOSEFS_FLAGS_HAS_ACL, COMPOSEFS_MAGIC, ComposefsHeader, VERSION,
+    };
+    use std::collections::BTreeMap;
+    use std::mem::offset_of;
+
+    let mut rust: Vec<(&str, i64)> = Vec::new();
+    macro_rules! layout {
+        ($c:literal, $t:ty, $($f:ident),+) => {
+            rust.push((concat!($c, ".size"), size_of::<$t>() as i64));
+            $(rust.push((concat!($c, ".", stringify!($f)), offset_of!($t, $f) as i64));)+
+        };
+    }
+    // A Rust constant named like the C one.
+    macro_rules! constant {
+        ($module:ident :: $name:ident) => {
+            rust.push((stringify!($name), $module::$name as i64));
+        };
+    }
+
+    layout!(
+        "lcfs_write_options_s",
+        LcfsWriteOptions,
+        format,
+        version,
+        flags,
+        digest_out,
+        file,
+        file_write_cb,
+        max_version,
+        reserved,
+        reserved2
+    );
+    layout!(
+        "lcfs_read_options_s",
+        LcfsReadOptions,
+        toplevel_entries,
+        reserved,
+        reserved2
+    );
+    layout!(
+        "lcfs_mount_options_s",
+        LcfsMountOptions,
+        objdirs,
+        n_objdirs,
+        workdir,
+        upperdir,
+        expected_fsverity_digest,
+        flags,
+        idmap_fd,
+        image_mountdir,
+        reserved,
+        reserved2
+    );
+    layout!(
+        "lcfs_erofs_header_s",
+        ComposefsHeader,
+        magic,
+        version,
+        flags,
+        composefs_version,
+        unused
+    );
+
+    constant!(crate::LCFS_DIGEST_SIZE);
+    constant!(image::LCFS_FORMAT_EROFS);
+    constant!(image::LCFS_FLAGS_MASK);
+    constant!(image::LCFS_VERSION_MAX);
+    constant!(fsverity::LCFS_BUILD_COMPUTE_DIGEST);
+    constant!(fsverity::LCFS_BUILD_NO_INLINE);
+    constant!(fsverity::LCFS_BUILD_BY_DIGEST);
+    constant!(fsverity::LCFS_RECOMMENDED_INLINE_CONTENT_MAX);
+    constant!(fsverity::ENOVERITY);
+    constant!(node::LCFS_INODE_XATTRMETA_SIZE);
+    constant!(node::LCFS_INODE_EXTERNAL_XATTR_MAX);
+    constant!(mount::ENOVERITY);
+    constant!(mount::EWRONGVERITY);
+    constant!(mount::LCFS_MOUNT_FLAGS_REQUIRE_VERITY);
+    constant!(mount::LCFS_MOUNT_FLAGS_READONLY);
+    constant!(mount::LCFS_MOUNT_FLAGS_IDMAP);
+    constant!(mount::LCFS_MOUNT_FLAGS_TRY_VERITY);
+    constant!(mount::LCFS_MOUNT_FLAGS_MASK);
+    rust.push(("LCFS_EROFS_VERSION", VERSION.get().into()));
+    rust.push(("LCFS_EROFS_MAGIC", COMPOSEFS_MAGIC.get().into()));
+    rust.push((
+        "LCFS_EROFS_FLAGS_HAS_ACL",
+        COMPOSEFS_FLAGS_HAS_ACL.get().into(),
+    ));
+
+    let c: BTreeMap<&str, i64> = include_str!("../tests/abi-layout.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let (name, value) = line.split_once(' ').unwrap();
+            (name, value.parse().unwrap())
+        })
+        .collect();
+
+    let mismatches: Vec<String> = rust
+        .iter()
+        .filter(|&&(name, value)| c.get(name) != Some(&value))
+        .map(|(name, value)| format!("{name}: Rust {value}, C {:?}", c.get(name)))
+        .collect();
+    assert!(mismatches.is_empty(), "ABI mismatches: {mismatches:#?}");
+
+    let unchecked_fields: Vec<&str> = c
+        .keys()
+        .copied()
+        .filter(|name| name.contains('.') && !rust.iter().any(|(r, _)| r == name))
+        .collect();
+    assert!(
+        unchecked_fields.is_empty(),
+        "C struct fields missing on the Rust side: {unchecked_fields:?}"
+    );
 }

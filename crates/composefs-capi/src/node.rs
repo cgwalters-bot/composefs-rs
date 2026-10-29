@@ -7,9 +7,9 @@ use crate::errno::set_errno;
 use crate::{FfiNode, FfiXattr, LCFS_DIGEST_SIZE};
 
 // EROFS xattr on-disk overhead constants, matching the C library.
-const LCFS_INODE_XATTRMETA_SIZE: usize = 4;
+pub(crate) const LCFS_INODE_XATTRMETA_SIZE: usize = 4;
 const LCFS_XATTR_HEADER_SIZE: usize = 12;
-const LCFS_INODE_EXTERNAL_XATTR_MAX: usize = u16::MAX as usize / 2; // 32767
+pub(crate) const LCFS_INODE_EXTERNAL_XATTR_MAX: usize = u16::MAX as usize / 2; // 32767
 const XATTR_NAME_MAX: usize = 255;
 
 // ---------------------------------------------------------------------------

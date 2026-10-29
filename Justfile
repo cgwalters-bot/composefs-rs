@@ -170,6 +170,18 @@ fuzz-list:
 test-capi *ARGS:
     crates/composefs-capi/tests/test-capi-container.sh {{ARGS}}
 
+# composefs-c commit that check-capi-abi compares libcomposefs.so.1 with.
+composefs_c_ref := "ec2573a0f68f548ae91f3e10acc990a08f9122dc"
+
+# Check that the Rust libcomposefs.so.1 is ABI-compatible with C's:
+# exported symbols, struct layouts and constants, C's unmodified
+# tests/test-lcfs, and a C consumer binary run against both libraries.
+# Optionally pass the path to a local checkout of the C composefs repo.
+check-capi-abi *ARGS:
+    cargo test -p composefs-capi --lib -- --exact tests::test_abi_layout_matches_c_headers
+    CAPI_CONTAINERFILE=Containerfile.abi-check COMPOSEFS_C_REF={{composefs_c_ref}} \
+        crates/composefs-capi/tests/test-capi-container.sh {{ARGS}}
+
 # Clean build artifacts
 clean:
     cargo clean
