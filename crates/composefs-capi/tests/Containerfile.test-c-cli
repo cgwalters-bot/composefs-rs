@@ -1,0 +1,18 @@
+FROM quay.io/fedora/fedora:latest
+RUN dnf -y install meson gcc pkg-config openssl-devel erofs-utils \
+    fsverity-utils gzip diffutils coreutils findutils util-linux which && dnf clean all
+COPY composefs-c /src/composefs-c
+WORKDIR /src/composefs-c
+RUN meson setup build && meson compile -C build
+COPY libcomposefs_capi.so cfsctl run-c-cli-suites.sh /rust/
+# composefs-dump is C code (tools/composefs-dump.c) running on the Rust
+# libcomposefs: Rust has no image-to-image rewrite helper.  Swap the
+# Rust library in under the C build's soname; run-c-cli-suites.sh checks
+# with ldd that composefs-dump really loads it.
+RUN cp /rust/libcomposefs_capi.so "$(readlink -f build/libcomposefs/libcomposefs.so.1)"
+# The tools directory holds the Rust multi-call links as the Makefile's
+# install-ctl rule makes them, plus C's composefs-dump.
+RUN install -D -m 755 /rust/cfsctl /tools/cfsctl && \
+    for t in mkcomposefs composefs-info mount.composefs; do ln -sf /tools/cfsctl /tools/$t; done && \
+    ln -sf /src/composefs-c/build/tools/composefs-dump /tools/composefs-dump
+CMD ["bash", "/rust/run-c-cli-suites.sh", "/tools", "/src/composefs-c/tests", "/rust/libcomposefs_capi.so"]
