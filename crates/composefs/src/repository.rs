@@ -1075,6 +1075,68 @@ enum GCCategoryWalkMode {
     AllEntries,
 }
 
+enum RefEntry {
+    Symlink(ErrnoResult<CString>),
+    Other(FileType),
+}
+
+/// GC looks up the target's basename in the category's first level. Targets
+/// without a basename (such as `..`) are deliberately skipped by GC.
+fn ref_target_entry(target: &[u8]) -> Option<&OsStr> {
+    Path::new(OsStr::from_bytes(target)).file_name()
+}
+
+/// Verify that GC's basename lookup names the same entry as the ref target.
+fn check_ref_target(
+    refs_fd: &OwnedFd,
+    category_fd: &OwnedFd,
+    category: &str,
+    target: &[u8],
+) -> Result<()> {
+    let entry_name = ref_target_entry(target).context("symlink target has no basename")?;
+    let target = Path::new(OsStr::from_bytes(target));
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = statat(refs_fd, parent.unwrap_or(Path::new(".")), AtFlags::empty())?;
+    let category_stat = statat(category_fd, c".", AtFlags::empty())?;
+    ensure!(
+        parent.st_dev == category_stat.st_dev && parent.st_ino == category_stat.st_ino,
+        "symlink target is outside the first level of {category}"
+    );
+    let entry = statat(refs_fd, target, AtFlags::SYMLINK_NOFOLLOW)?;
+    ensure!(
+        entry_name != OsStr::new("refs")
+            && FileType::from_raw_mode(entry.st_mode) == FileType::Symlink,
+        "symlink target is not a first-level symlink"
+    );
+    Ok(())
+}
+
+/// Parse the object-store link layout used by first-level category entries.
+fn parse_first_level_target<ObjectID: FsVerityHashValue>(target: &[u8]) -> Result<ObjectID> {
+    let target_path = Path::new(OsStr::from_bytes(target));
+    let path = target_path
+        .strip_prefix(".")
+        .unwrap_or(target_path)
+        .strip_prefix("../objects")
+        .context("target is outside ../objects")?;
+    ensure!(
+        path.components().count() == 2,
+        "object path must have two components"
+    );
+    ensure!(
+        path.components()
+            .next()
+            .is_some_and(|c| c.as_os_str().len() == 2),
+        "object directory must have two characters"
+    );
+    ensure!(
+        path.file_name()
+            .is_some_and(|name| name.len() == 2 * std::mem::size_of::<ObjectID>() - 2),
+        "object filename has the wrong length"
+    );
+    ObjectID::from_object_pathname(target).context("invalid object ID in target")
+}
+
 /// Statistics from a garbage collection operation.
 ///
 /// Returned by [`Repository::gc`] to report what was (or would be) removed.
@@ -2966,8 +3028,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .context("Parsing object ID from symlink target")
     }
 
+    /// Walk refs once for both GC and fsck. The visitor decides how to handle
+    /// non-symlinks and readlink errors; fsck records findings where GC fails.
     #[context("Walking symlink directory")]
-    fn walk_symlinkdir(fd: OwnedFd, entry_digests: &mut HashSet<OsString>) -> Result<()> {
+    fn walk_symlinkdir(
+        fd: &OwnedFd,
+        prefix: &Path,
+        visit: &mut impl FnMut(&OwnedFd, &Path, RefEntry) -> Result<()>,
+    ) -> Result<()> {
         for item in Dir::read_from(&fd).context("Reading directory entries")? {
             let entry = item.context("Reading directory entry")?;
             // NB: the underlying filesystem must support returning filetype via direntry
@@ -2983,23 +3051,21 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                             Mode::empty(),
                         )
                         .context("Opening subdirectory for walking")?;
-                        Self::walk_symlinkdir(dirfd, entry_digests)?;
+                        let path = prefix.join(OsStr::from_bytes(filename.to_bytes()));
+                        Self::walk_symlinkdir(&dirfd, &path, visit)?;
                     }
                 }
                 FileType::Symlink => {
-                    let link_content = readlinkat(&fd, entry.file_name(), [])
-                        .context("Reading symlink content")?;
-                    let linked_path = Path::new(OsStr::from_bytes(link_content.as_bytes()));
-                    if let Some(entry_name) = linked_path.file_name() {
-                        entry_digests.insert(entry_name.to_os_string());
-                    } else {
-                        // Does not have a proper file base name (i.e. "..")
-                        // TODO: this case needs to be checked in fsck implementation
-                        continue;
-                    }
+                    let path = prefix.join(OsStr::from_bytes(entry.file_name().to_bytes()));
+                    visit(
+                        fd,
+                        &path,
+                        RefEntry::Symlink(readlinkat(fd, entry.file_name(), [])),
+                    )?;
                 }
                 _ => {
-                    bail!("Unexpected file type encountered");
+                    let path = prefix.join(OsStr::from_bytes(entry.file_name().to_bytes()));
+                    visit(fd, &path, RefEntry::Other(entry.file_type()))?;
                 }
             }
         }
@@ -3025,7 +3091,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // Under AllEntries mode, all entires will be returned
     // Note that this function assumes all`*/refs/` links link to 1st level entries
     // and all 1st level entries link to object store
-    // TODO: fsck the above noted assumption
     #[context("Walking GC category '{category}'")]
     fn gc_category(
         &self,
@@ -3055,8 +3120,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 .filter_errno(Errno::NOENT)
                 .context(format!("Opening {category}/refs dir in repository"))?
                 {
-                    Self::walk_symlinkdir(refs, &mut entry_digests)
-                        .context("Walking refs symlink directory")?;
+                    Self::walk_symlinkdir(&refs, Path::new(""), &mut |_, _, entry| {
+                        let RefEntry::Symlink(target) = entry else {
+                            bail!("Unexpected file type encountered");
+                        };
+                        let target = target.context("Reading symlink content")?;
+                        if let Some(entry_name) = ref_target_entry(target.as_bytes()) {
+                            entry_digests.insert(entry_name.to_os_string());
+                        }
+                        Ok(())
+                    })
+                    .context("Walking refs symlink directory")?;
                 }
             }
             GCCategoryWalkMode::AllEntries => {
@@ -3617,6 +3691,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 continue;
             }
 
+            let target = readlinkat(&category_fd, filename, [])
+                .context("Reading first-level symlink target")?;
+            let target_path = Path::new(OsStr::from_bytes(target.as_bytes()));
+            if parse_first_level_target::<ObjectID>(target.as_bytes()).is_err() {
+                if is_streams {
+                    result.streams_corrupted += 1;
+                } else {
+                    result.images_corrupted += 1;
+                }
+                result.errors.push(FsckError::UnexpectedFileType {
+                    path: format!("{category}/{}", filename.to_string_lossy()),
+                    detail: format!(
+                        "symlink target {} is not ../objects/<object path>",
+                        target_path.display()
+                    ),
+                });
+                continue;
+            }
+
             // Check the symlink resolves (follows through to the object)
             match statat(&category_fd, filename, AtFlags::empty()) {
                 Ok(_) => {}
@@ -3671,7 +3764,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             None => return Ok(()),
         };
 
-        self.fsck_refs_dir(&refs_fd, category, "", result)
+        self.fsck_refs_dir(&refs_fd, &category_fd, category, result)
             .with_context(|| format!("Checking {category}/refs"))
     }
 
@@ -3680,45 +3773,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     fn fsck_refs_dir(
         &self,
         refs_fd: &OwnedFd,
+        category_fd: &OwnedFd,
         category: &str,
-        prefix: &str,
         result: &mut FsckResult,
     ) -> Result<()> {
-        for item in Dir::read_from(refs_fd)
-            .with_context(|| format!("Reading {category}/refs/{prefix} directory"))?
-        {
-            let entry = item.context("Reading refs directory entry")?;
-            let filename = entry.file_name();
-            if filename == c"." || filename == c".." {
-                continue;
-            }
-
-            let name = String::from_utf8_lossy(filename.to_bytes()).to_string();
-            let display_path = if prefix.is_empty() {
-                format!("{category}/refs/{name}")
-            } else {
-                format!("{category}/refs/{prefix}/{name}")
-            };
-
-            match entry.file_type() {
-                FileType::Directory => {
-                    let subdir = openat(
-                        refs_fd,
-                        filename,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .with_context(|| format!("Opening {display_path}"))?;
-                    let sub_prefix = if prefix.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    self.fsck_refs_dir(&subdir, category, &sub_prefix, result)?;
-                }
-                FileType::Symlink => {
-                    // The ref should ultimately resolve to a file (following
-                    // the chain: refs/X -> ../../entry -> ../objects/XX/YY)
+        Self::walk_symlinkdir(refs_fd, Path::new(""), &mut |refs_fd, path, entry| {
+            let filename = path.file_name().expect("ref entry has a filename");
+            let display_path = format!("{category}/refs/{}", path.display());
+            match entry {
+                RefEntry::Symlink(target) => {
+                    // Following the link checks for missing entries or objects.
                     match statat(refs_fd, filename, AtFlags::empty()) {
                         Ok(_) => {}
                         Err(Errno::NOENT) => {
@@ -3726,24 +3790,39 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                             result.errors.push(FsckError::BrokenSymlink {
                                 path: display_path.clone(),
                             });
+                            return Ok(());
                         }
                         Err(e) => {
                             result.errors.push(FsckError::StatFailed {
                                 path: display_path.clone(),
                                 detail: e.to_string(),
                             });
+                            return Ok(());
                         }
                     }
+
+                    // GC uses the target basename to look up a first-level entry.
+                    // Compare parent directories without following the final symlink;
+                    // this also accommodates refs at any depth and noncanonical paths.
+                    let checked = target.map_err(anyhow::Error::from).and_then(|target| {
+                        check_ref_target(refs_fd, category_fd, category, target.as_bytes())
+                    });
+                    if let Err(e) = checked {
+                        result.errors.push(FsckError::UnexpectedFileType {
+                            path: display_path,
+                            detail: e.to_string(),
+                        });
+                    }
                 }
-                other => {
+                RefEntry::Other(other) => {
                     result.errors.push(FsckError::UnexpectedFileType {
                         path: display_path.clone(),
                         detail: format!("{other:?}"),
                     });
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Validate a single splitstream: check header and object references.
@@ -4131,6 +4210,78 @@ mod tests {
     use rustix::fs::{CWD, statat};
     use tempfile::TempDir;
 
+    #[test]
+    fn test_parse_first_level_target() {
+        fn check<ObjectID: FsVerityHashValue>() {
+            let id = compute_verity::<ObjectID>(b"layout test");
+            let object_path = id.to_object_pathname();
+            for (target, expected_error) in [
+                (format!("../objects/{object_path}"), None),
+                (format!("./../objects/./{object_path}"), None),
+                (format!("../outside/{object_path}"), Some("outside")),
+                ("../objects/not-a-hash".into(), Some("two components")),
+                (
+                    format!("../objects/extra/{object_path}"),
+                    Some("two components"),
+                ),
+                (
+                    format!("../objects/{}", object_path.replace('/', "")),
+                    Some("two components"),
+                ),
+                (format!("../objects/0{object_path}"), Some("two characters")),
+                ("../objects/zz/invalid".into(), Some("wrong length")),
+                (
+                    format!("../objects/zz/{}", &object_path[3..]),
+                    Some("invalid object ID"),
+                ),
+                (
+                    format!(
+                        "../objects/aa/{}",
+                        "z".repeat(2 * std::mem::size_of::<ObjectID>() - 2)
+                    ),
+                    Some("invalid object ID"),
+                ),
+                ("..".into(), Some("outside")),
+            ] {
+                let parsed = parse_first_level_target::<ObjectID>(target.as_bytes());
+                if let Some(message) = expected_error {
+                    let error = parsed.unwrap_err().to_string();
+                    assert!(error.contains(message), "{target}: {error}");
+                } else {
+                    assert_eq!(parsed.unwrap(), id, "{target}");
+                }
+            }
+        }
+        check::<Sha256HashValue>();
+        check::<Sha512HashValue>();
+    }
+
+    #[test]
+    fn test_ref_target_entry() {
+        for (target, expected) in [
+            (b"../entry".as_slice(), Some(b"entry".as_slice())),
+            (b"../../../entry", Some(b"entry")),
+            (b".././../../entry", Some(b"entry")),
+            (b"entry", Some(b"entry")),
+            (b"/outside/entry", Some(b"entry")),
+            (b"../entry/", Some(b"entry")),
+            (b"../entry/.", Some(b"entry")),
+            (b"../\xff", Some(b"\xff")),
+            (b"", None),
+            (b"/", None),
+            (b".", None),
+            (b"..", None),
+            (b"../..", None),
+            (b"entry/..", None),
+        ] {
+            assert_eq!(
+                ref_target_entry(target).map(OsStrExt::as_bytes),
+                expected,
+                "{target:?}"
+            );
+        }
+    }
+
     /// Create a test repository in insecure mode (no fs-verity required).
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
         let (repo, _) = Repository::init_path(
@@ -4176,7 +4327,7 @@ mod tests {
     fn test_object_exists(tmp: &TempDir, obj: &Sha512HashValue) -> Result<bool> {
         let digest = obj.to_hex();
         let (first_two, remainder) = digest.split_at(2);
-        test_path_exists_in_repo(tmp, &format!("objects/{first_two}/{remainder}"))
+        test_path_exists_in_repo(tmp, format!("objects/{first_two}/{remainder}"))
     }
 
     #[test]
@@ -5161,6 +5312,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fsck_refs_target_layout() -> Result<()> {
+        for (reference, target, expected) in [
+            ("by-sha256/hash", "..", "invalid"),
+            ("by-sha256/hash", "../..", "invalid"),
+            ("ref", "../../outside/test-stream", "invalid"),
+            ("ref", "../../missing/test-stream", "broken"),
+            ("ref", "../../images/test-stream", "invalid"),
+            ("ref", "test-stream", "invalid"),
+            ("ref", "../refs/test-stream", "invalid"),
+            ("ref", "../regular-file", "invalid"),
+            ("ref", "../missing-stream", "broken"),
+            ("nested/deep/ref", "../../../missing-stream", "broken"),
+            ("ref", "../test-stream", "clean"),
+            ("nested/deep/ref", "../../../test-stream", "clean"),
+            ("nested/deep/ref", ".././../../test-stream", "clean"),
+        ] {
+            let tmp = tempdir();
+            let repo = create_test_repo(&tmp.path().join("repo"))?;
+            let writer = repo.create_stream(0)?;
+            let id = repo.write_stream(writer, "test-stream", None)?;
+            let dir = open_test_repo_dir(&tmp);
+            dir.create_dir_all("streams/refs/nested/deep")?;
+            dir.create_dir_all("streams/refs/by-sha256")?;
+            dir.create_dir_all("outside")?;
+            dir.create_dir_all("images")?;
+            let object_target = format!("../objects/{}", id.to_object_pathname());
+            // Make outside-first-level targets and a ref-to-ref chain resolvable.
+            dir.symlink(&object_target, "outside/test-stream")?;
+            dir.symlink(&object_target, "images/test-stream")?;
+            dir.symlink("../test-stream", "streams/refs/test-stream")?;
+            if target == "../regular-file" {
+                dir.write("streams/regular-file", b"not a symlink")?;
+            }
+            let ref_path = format!("streams/refs/{reference}");
+            dir.symlink(target, &ref_path)?;
+
+            // Check just this category so fixture entries in images/ and streams/
+            // don't introduce unrelated content or file-type errors.
+            let mut result = FsckResult::default();
+            repo.fsck_category("streams", &mut result)?;
+            let errors: Vec<_> = result
+                .errors
+                .iter()
+                .filter(|error| match error {
+                    FsckError::UnexpectedFileType { path, .. }
+                    | FsckError::BrokenSymlink { path } => path == &ref_path,
+                    _ => false,
+                })
+                .collect();
+            match expected {
+                "invalid" => {
+                    assert_eq!(errors.len(), 1, "{target}: {result}");
+                    assert!(matches!(errors[0], FsckError::UnexpectedFileType { .. }));
+                    assert_eq!(result.broken_links, 0, "{target}: {result}");
+                }
+                "broken" => {
+                    assert_eq!(errors.len(), 1, "{target}: {result}");
+                    assert!(matches!(errors[0], FsckError::BrokenSymlink { .. }));
+                    assert_eq!(result.broken_links, 1, "{target}: {result}");
+                }
+                "clean" => {
+                    assert!(result.is_ok(), "{target}: {result}");
+                    assert_eq!(result.streams_checked, 1);
+                    assert_eq!(result.broken_links, 0);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_first_level_target_layout() -> Result<()> {
+        for category in ["streams", "images"] {
+            for target in [
+                "../outside/OBJECT",
+                "../objects/not-a-hash",
+                "../objects/extra/OBJECT",
+                "../objects/0OBJECT",
+                "../objects/zz/invalid",
+                "..",
+            ] {
+                let tmp = tempdir();
+                let repo = create_test_repo(&tmp.path().join("repo"))?;
+                let dir = open_test_repo_dir(&tmp);
+                let name = if category == "streams" {
+                    let writer = repo.create_stream(0)?;
+                    repo.write_stream(writer, "source", None)?;
+                    "source".to_owned()
+                } else {
+                    let data = b"test object";
+                    let id = repo.ensure_object(data)?;
+                    make_test_fs(&id, data.len() as u64)
+                        .commit_image(&repo, None)?
+                        .to_hex()
+                };
+                let source = format!("{category}/{name}");
+                let data = dir.read(&source)?;
+                let object_path = dir.read_link(&source)?;
+                let object_path = object_path.strip_prefix("../objects")?;
+                let target = target.replace("OBJECT", &object_path.to_string_lossy());
+                dir.remove_file(&source)?;
+                if target != ".." {
+                    let path = PathBuf::from(category).join(&target);
+                    dir.create_dir_all(path.parent().unwrap())?;
+                    dir.write(&path, &data)?;
+                }
+                let entry_path = format!("{category}/bad-link");
+                dir.symlink(&target, &entry_path)?;
+
+                let mut result = FsckResult::default();
+                repo.fsck_category(category, &mut result)?;
+                assert_eq!(result.errors.len(), 1, "{target}: {result}");
+                assert!(matches!(
+                    &result.errors[0],
+                    FsckError::UnexpectedFileType { path, .. } if path == &entry_path
+                ));
+                assert_eq!(result.broken_links, 0);
+                assert_eq!(result.streams_corrupted + result.images_corrupted, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fsck_detects_non_symlink_in_streams() -> Result<()> {
         // Exercises fsck_category non-symlink detection (line ~1695).
         // The code checks entry.file_type() != FileType::Symlink and reports
@@ -5440,7 +5716,13 @@ mod tests {
         let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         // write_stream with reference creates a ref symlink
-        let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
+        let stream_id = repo.write_stream(writer, "test-stream", Some("nested/deep/my-ref"))?;
+        let dir = open_test_repo_dir(&tmp);
+        dir.remove_file("streams/test-stream")?;
+        dir.symlink(
+            format!("./../objects/./{}", stream_id.to_object_pathname()),
+            "streams/test-stream",
+        )?;
         repo.sync()?;
 
         let result = repo.fsck().await?;
@@ -5587,10 +5869,8 @@ mod tests {
         use crate::erofs::writer::{ValidatedFileSystem, mkfs_erofs_versioned};
 
         let fs = make_test_fs(obj_id, obj_size);
-        let image_data = mkfs_erofs_versioned(
-            &mut ValidatedFileSystem::new(fs).unwrap(),
-            FormatVersion::V1,
-        );
+        let image_data =
+            mkfs_erofs_versioned(&ValidatedFileSystem::new(fs).unwrap(), FormatVersion::V1);
         repo.write_image(None, &image_data)
     }
 
@@ -5680,7 +5960,7 @@ mod tests {
         let tmp = tempdir();
         let path = tmp.path().join("old-repo");
         mkdirat(CWD, &path, Mode::from_raw_mode(0o755)).unwrap();
-        mkdirat(CWD, &path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
+        mkdirat(CWD, path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
         assert!(matches!(
             Repository::<Sha512HashValue>::open_path(CWD, &path),
             Err(RepositoryOpenError::OldFormatRepository)
@@ -6215,7 +6495,7 @@ mod tests {
         let tmp = tempdir();
         let repo_path = tmp.path().join("repo");
         mkdirat(CWD, &repo_path, Mode::from_raw_mode(0o755)).unwrap();
-        mkdirat(CWD, &repo_path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
+        mkdirat(CWD, repo_path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
 
         let err = Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap_err();
         let msg = format!("{err:#}");
