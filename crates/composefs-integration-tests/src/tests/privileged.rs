@@ -1157,7 +1157,8 @@ fn bigfile_content() -> Vec<u8> {
 }
 
 fn biglib_content() -> Vec<u8> {
-    (0u8..=255).cycle().take(800).collect()
+    // Cross read/page boundaries, with a partial final page.
+    (0u8..=255).cycle().take(16 * 1024 + 37).collect()
 }
 
 fn build_test_filesystem(
@@ -1210,7 +1211,7 @@ fn build_test_filesystem(
 
     let readme_id = LeafId(fs.leaves.len());
     fs.leaves.push(Leaf {
-        stat: mkstat(0o644, 0, 0, 1_700_000_002),
+        stat: mkstat(0o640, 123, 456, 1_700_000_002),
         content: LeafContent::Regular(RegularFile::Inline(
             b"readme text content\n".as_ref().into(),
         )),
@@ -1245,6 +1246,16 @@ fn build_test_filesystem(
         stat: mkstat(0o644, 0, 0, 1_700_000_006),
         content: LeafContent::Fifo,
     });
+
+    let block_id = fs.push_leaf(
+        mkstat(0o660, 0, 6, 1_700_000_006),
+        LeafContent::BlockDevice(rustix::fs::makedev(8, 1)),
+    );
+    let socket_id = fs.push_leaf(mkstat(0o600, 123, 456, 1_700_000_006), LeafContent::Socket);
+    let empty_id = fs.push_leaf(
+        mkstat(0o644, 0, 0, 1_700_000_006),
+        LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+    );
 
     let bigfile_data = bigfile_content();
     let bigfile_hash = repo.ensure_object(&bigfile_data)?;
@@ -1285,9 +1296,16 @@ fn build_test_filesystem(
 
     let mut dev = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_014));
     dev.insert(OsStr::new("null"), Inode::leaf(devnull_id));
+    dev.insert(OsStr::new("block"), Inode::leaf(block_id));
 
     let mut tmp_dir = Directory::<Sha256HashValue>::new(mkstat(0o1777, 0, 0, 1_700_000_015));
     tmp_dir.insert(OsStr::new("fifo"), Inode::leaf(fifo_id));
+    tmp_dir.insert(OsStr::new("socket"), Inode::leaf(socket_id));
+    tmp_dir.insert(OsStr::new("empty"), Inode::leaf(empty_id));
+    tmp_dir.stat.xattrs.insert(
+        OsStr::new("user.directory").into(),
+        Box::from(b"directory-value".as_ref()),
+    );
 
     fs.root
         .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr)));
@@ -1307,6 +1325,7 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
 
     use composefs_oci::composefs::{
         dumpfile::write_dumpfile,
+        dumpfile_parse::{Entry, Item},
         erofs::{
             reader::erofs_to_filesystem,
             writer::{ValidatedFileSystem, mkfs_erofs},
@@ -1386,29 +1405,52 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
-        .context("reading bigfile from FUSE mount")?;
-    ensure!(
-        bigfile_actual == bigfile_content(),
-        "bigfile content mismatch: got {} bytes, expected {}",
-        bigfile_actual.len(),
-        bigfile_content().len(),
-    );
-    let biglib_actual = std::fs::read(mountpoint.join("usr/lib/biglib.so"))
-        .context("reading biglib.so from FUSE mount")?;
-    ensure!(
-        biglib_actual == biglib_content(),
-        "biglib.so content mismatch: got {} bytes, expected {}",
-        biglib_actual.len(),
-        biglib_content().len(),
-    );
-
     let sh = Shell::new()?;
-    let mp = mountpoint.to_str().context("non-UTF-8 mountpoint")?;
-    let repo_arg = repo_path.to_str().context("non-UTF-8 repo path")?;
+
+    // A missing FUSE reply must fail the test rather than hang its client.
+    let probe_timeout = "30s";
+    let kill_after = "5s";
+
+    // Probe known paths before readdir can populate the kernel's inode cache.
+    // The scanner below reconstructs link counts from the tree, so separately
+    // check the mount's actual getattr replies (including directory nlink).
+    for line in expected_dump.lines() {
+        let entry = Entry::parse(line)?;
+        let path = mountpoint.join(entry.path.strip_prefix("/")?);
+        let nlink = match entry.item {
+            Item::Hardlink { target } => {
+                let target = mountpoint.join(target.strip_prefix("/")?);
+                let actual = cmd!(sh, "timeout --kill-after={kill_after} {probe_timeout} stat --format=%d:%i -- {path}").read()?;
+                let expected = cmd!(sh, "timeout --kill-after={kill_after} {probe_timeout} stat --format=%d:%i -- {target}").read()?;
+                ensure!(actual == expected, "hardlink inode mismatch: {path:?}");
+                continue;
+            }
+            Item::RegularInline { nlink, .. }
+            | Item::Regular { nlink, .. }
+            | Item::Device { nlink, .. }
+            | Item::Symlink { nlink, .. }
+            | Item::Fifo { nlink }
+            | Item::Socket { nlink }
+            | Item::Directory { nlink } => nlink,
+        };
+        let actual = cmd!(sh, "timeout --kill-after={kill_after} {probe_timeout} stat --format=%f:%h:%u:%g:%Y -- {path}").read()?;
+        let expected = format!(
+            "{:x}:{nlink}:{}:{}:{}",
+            entry.mode, entry.uid, entry.gid, entry.mtime.sec,
+        );
+        ensure!(
+            actual == expected,
+            "getattr mismatch for {path:?}: expected {expected}, got {actual}",
+        );
+    }
+
+    // An independent process walks the real mount: readdir, lookup/open,
+    // fstat, readlink, listxattr/getxattr and reads of all regular files.
+    // --no-repo hashes external content without reusing the source objects.
+    // Special files are inspected, never opened for I/O (a FIFO would block).
     let actual_dump = cmd!(
         sh,
-        "{cfsctl_bin} --repo {repo_arg} create-dumpfile --no-propagate-usr-to-root {mp}"
+        "timeout --kill-after={kill_after} {probe_timeout} {cfsctl_bin} --hash sha256 --no-repo create-dumpfile --no-propagate-usr-to-root {mountpoint}"
     )
     .read()?;
 
