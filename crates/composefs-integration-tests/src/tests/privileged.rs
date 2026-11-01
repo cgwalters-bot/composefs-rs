@@ -1153,11 +1153,11 @@ impl Drop for MountGuard {
 }
 
 fn bigfile_content() -> Vec<u8> {
-    vec![b'A'; 600]
+    vec![b'A'; 128 * 1024]
 }
 
 fn biglib_content() -> Vec<u8> {
-    (0u8..=255).cycle().take(800).collect()
+    (0u8..=255).cycle().take(256 * 1024 + 17).collect()
 }
 
 fn build_test_filesystem(
@@ -1178,7 +1178,19 @@ fn build_test_filesystem(
             st_gid: gid,
             st_mtim_sec: mtime,
             st_mtim_nsec: 0,
-            xattrs: BTreeMap::new(),
+            // Exercise listxattr/getxattr on directories and every leaf type,
+            // including empty and binary values (not just printable strings).
+            // Unlike user.*, security.* is readable on special files too.
+            xattrs: BTreeMap::from([
+                (
+                    OsStr::new("security.test-empty").into(),
+                    Box::from(&b""[..]),
+                ),
+                (
+                    OsStr::new("security.test-binary").into(),
+                    Box::from(&b"\0\xff=value\n"[..]),
+                ),
+            ]),
         }
     }
 
@@ -1195,9 +1207,9 @@ fn build_test_filesystem(
         );
         fs.leaves.push(Leaf {
             stat: Stat {
-                st_mode: 0o755,
-                st_uid: 0,
-                st_gid: 0,
+                st_mode: 0o4751,
+                st_uid: 1234,
+                st_gid: 2345,
                 st_mtim_sec: 1_700_000_001,
                 st_mtim_nsec: 0,
                 xattrs,
@@ -1286,8 +1298,46 @@ fn build_test_filesystem(
     let mut dev = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_014));
     dev.insert(OsStr::new("null"), Inode::leaf(devnull_id));
 
+    let block_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o640, 1234, 2345, 1_700_000_016),
+        content: LeafContent::BlockDevice(rustix::fs::makedev(8, 1)),
+    });
+    dev.insert(OsStr::new("disk"), Inode::leaf(block_id));
+
     let mut tmp_dir = Directory::<Sha256HashValue>::new(mkstat(0o1777, 0, 0, 1_700_000_015));
     tmp_dir.insert(OsStr::new("fifo"), Inode::leaf(fifo_id));
+    for (name, content) in [
+        ("socket", LeafContent::Socket),
+        (
+            "empty",
+            LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+        ),
+        (
+            "inline-binary",
+            LeafContent::Regular(RegularFile::Inline(Box::from(&b"\0\xff\ninline"[..]))),
+        ),
+        (
+            "dangling-link",
+            LeafContent::Symlink(OsStr::new("missing-target").into()),
+        ),
+    ] {
+        let id = LeafId(fs.leaves.len());
+        fs.leaves.push(Leaf {
+            stat: mkstat(0o751, 1234, 2345, 1_700_000_017),
+            content,
+        });
+        tmp_dir.insert(OsStr::new(name), Inode::leaf(id));
+    }
+    tmp_dir.insert(
+        OsStr::new("empty-dir"),
+        Inode::Directory(Box::new(Directory::new(mkstat(
+            0o2750,
+            1234,
+            2345,
+            1_700_000_018,
+        )))),
+    );
 
     fs.root
         .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr)));
@@ -1386,23 +1436,11 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
-        .context("reading bigfile from FUSE mount")?;
-    ensure!(
-        bigfile_actual == bigfile_content(),
-        "bigfile content mismatch: got {} bytes, expected {}",
-        bigfile_actual.len(),
-        bigfile_content().len(),
-    );
-    let biglib_actual = std::fs::read(mountpoint.join("usr/lib/biglib.so"))
-        .context("reading biglib.so from FUSE mount")?;
-    ensure!(
-        biglib_actual == biglib_content(),
-        "biglib.so content mismatch: got {} bytes, expected {}",
-        biglib_actual.len(),
-        biglib_content().len(),
-    );
-
+    // The external scanner uses readdir, openat (lookup), fstat (getattr),
+    // readlinkat, listxattr/getxattr, and reads every regular file. Comparing
+    // its dump checks inline bytes and external files' computed verity digests,
+    // as well as metadata, device numbers, symlink targets and hardlink identity.
+    // It never opens devices, FIFOs or sockets for I/O.
     let sh = Shell::new()?;
     let mp = mountpoint.to_str().context("non-UTF-8 mountpoint")?;
     let repo_arg = repo_path.to_str().context("non-UTF-8 repo path")?;

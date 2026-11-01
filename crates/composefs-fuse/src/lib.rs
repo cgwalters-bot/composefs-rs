@@ -710,6 +710,8 @@ impl Filesystem for ComposefsFuse {
         };
 
         let handle = match layout {
+            // Empty files have no inline data or backing-object redirect.
+            DataLayout::FlatPlain if inode.size() == 0 => OpenHandle::Data(Box::new([])),
             DataLayout::FlatInline => match inode.inline() {
                 Some(data) => OpenHandle::Data(data.into()),
                 None => OpenHandle::Data(Box::new([])),
