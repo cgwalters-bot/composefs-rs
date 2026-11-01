@@ -1,7 +1,7 @@
 //! Tests for containers-storage import functionality.
 //!
 //! These tests verify that importing from containers-storage produces identical
-//! results to importing via skopeo/tar streaming.
+//! results to importing the same image's tar layers from an OCI layout.
 //!
 //! These tests require `podman unshare` which needs user namespace support.
 //! On environments without proper user namespace support (like GHA runners),
@@ -42,7 +42,8 @@ fn copy_image_to_separate_store(sh: &Shell, image_id: &str, dest: &std::path::Pa
     Ok(())
 }
 
-/// Test that containers-storage import produces identical results to skopeo/tar import.
+/// Test that containers-storage import produces identical results to a tar
+/// import from an `oci:` layout written by `skopeo copy`.
 ///
 /// This is a critical correctness test: both import paths should produce the
 /// exact same splitstream digests because they represent the same content.
@@ -77,7 +78,7 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         let cstor_result =
             composefs_oci::pull(&cstor_repo, &cstor_image_ref, None, cstor_opts).await?;
 
-        // Import via skopeo (tar streaming path) - copy to OCI directory first
+        // Import via the tar streaming path - copy to OCI directory first
         let oci_dir = TempDir::new()?;
         let oci_path = oci_dir.path().join("image");
 
@@ -89,9 +90,10 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         println!("Copying to OCI dir via skopeo...");
         cmd!(sh, "skopeo copy {cstor_ref} {oci_ref}").run()?;
 
-        // Import from the OCI directory via skopeo/tar path
+        // Import from the OCI directory via the direct OCI layout tar path
+        // (pull_image reads oci: layouts itself, without the skopeo proxy)
         let skopeo_image_ref = format!("oci:{}:test", oci_path.display());
-        println!("Importing via skopeo/OCI: {}", skopeo_image_ref);
+        println!("Importing via OCI layout: {}", skopeo_image_ref);
         let (skopeo_pull_result, _skopeo_stats) = composefs_oci::pull_image(
             &skopeo_repo,
             &skopeo_image_ref,
@@ -130,20 +132,13 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
             "layer verity IDs must match"
         );
 
-        println!("CSTOR config verity: {:?}", cstor_result.config_verity);
-        println!("SKOPEO config verity: {:?}", skopeo_config_verity);
-
-        // NOTE: Config verity IDs may differ due to layer ref ordering.
-        // The skopeo path sorts layers by size for parallel fetching, then adds
-        // named refs in that order. The cstor path adds refs in config order.
-        // Both produce valid splitstreams with correct content, but different verity.
-        // TODO: Fix the ordering discrepancy in one of the implementations.
-        if cstor_result.config_verity != skopeo_config_verity {
-            println!(
-                "WARNING: Config verity IDs differ due to layer ref ordering. \
-                 Content is equivalent but splitstream structure differs."
-            );
-        }
+        // Manifest verities are not compared: `skopeo copy` writes a new
+        // manifest into the OCI directory, so its digest differs from the one
+        // in containers-storage.
+        assert_eq!(
+            cstor_result.config_verity, skopeo_config_verity,
+            "config verity IDs must match"
+        );
 
         println!("SUCCESS: Both import paths produced equivalent content");
         println!("  Config digest: {}", cstor_result.config_digest);

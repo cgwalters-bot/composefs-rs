@@ -622,7 +622,7 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         (!needs_proxy).then_some((kind, layout_path, layout_tag))
     });
 
-    let (result, stats) = if let Some((kind, layout_path, layout_tag)) = oci_layout {
+    let (mut result, stats) = if let Some((kind, layout_path, layout_tag)) = oci_layout {
         crate::oci_layout::import_oci_layout(repo, kind, layout_path, layout_tag, reporter).await?
     } else {
         // Standard path: use skopeo proxy for other transports
@@ -642,11 +642,18 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         reference,
         boot_options,
     )?;
-    if erofs.is_none() {
+    if erofs.is_some() {
+        // The config and manifest splitstreams were rewritten to add the
+        // EROFS ref, so the verities captured during import are stale.
+        result.config_verity = repo
+            .has_stream(&config_identifier(&result.config_digest))?
+            .context("config splitstream missing after EROFS generation")?;
+        result.manifest_verity = repo
+            .has_stream(&manifest_identifier(&result.manifest_digest))?
+            .context("manifest splitstream missing after EROFS generation")?;
+    } else if let Some(name) = reference {
         // Not a container image (artifact) — tag the manifest directly
-        if let Some(name) = reference {
-            tag_image(repo, &result.manifest_digest, name)?;
-        }
+        tag_image(repo, &result.manifest_digest, name)?;
     }
 
     Ok((result, stats))

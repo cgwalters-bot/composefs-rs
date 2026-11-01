@@ -2556,6 +2556,44 @@ mod test {
         oci_dir
     }
 
+    /// EROFS generation rewrites the config and manifest splitstreams, so the
+    /// verities `pull_image` returns must be the ones stored afterwards.
+    #[tokio::test]
+    async fn test_pull_image_returns_current_verities() {
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        let layout = crate::test_util::build_oci_layout(&["\
+            /usr 0 40755 2 0 0 0 0.0 - - -\n\
+            /usr/bin 0 40755 2 0 0 0 0.0 - - -\n\
+            /usr/bin/hello 21 100755 1 0 0 0 0.0 - #!/bin/sh\\necho\\x20hello\\n -\n"]);
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let reporter: crate::progress::SharedReporter = std::sync::Arc::new(crate::NullReporter);
+        let (result, _) = skopeo::pull_image(
+            repo,
+            &format!("oci:{}", layout.path().display()),
+            None,
+            None,
+            reporter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let config_verity = repo
+            .has_stream(&config_identifier(&result.config_digest))
+            .unwrap()
+            .unwrap();
+        let manifest_verity = repo
+            .has_stream(&oci_image::manifest_identifier(&result.manifest_digest))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.config_verity, config_verity);
+        assert_eq!(result.manifest_verity, manifest_verity);
+    }
+
     /// A gzip-compressed `oci-archive:` is not readable by the direct
     /// `OciArchive` fast path, but containers/image decompresses it
     /// transparently, so the pull must fall back to the skopeo proxy.
