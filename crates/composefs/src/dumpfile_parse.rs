@@ -22,6 +22,10 @@ use rustix::fs::FileType;
 
 use crate::MAX_INLINE_CONTENT;
 
+// C's lcfs_node_validate caps non-inline regular files at 1024 chunks so
+// the stub fits in one block. EROFS permits chunk sizes up to 2^(12 + 31).
+const DUMPFILE_NONINLINE_SIZE_MAX: u64 = 1024 * (1 << (12 + 31));
+
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L13
 const PATH_MAX: u32 = 4096;
 use crate::SYMLINK_MAX;
@@ -155,6 +159,9 @@ fn unescape_limited(s: &str, max: usize) -> Result<Cow<'_, [u8]>> {
             anyhow::bail!("Input exceeded maximum length {max}");
         }
         if c != '\\' {
+            if c.len_utf8() > max - r.len() {
+                anyhow::bail!("Input exceeded maximum length {max}");
+            }
             write!(r, "{c}").unwrap();
             continue;
         }
@@ -338,6 +345,9 @@ impl<'k> Xattr<'k> {
             .ok_or_else(|| anyhow!("Missing = in xattrs"))?;
         let key = unescape_to_osstr(key)?;
         let keylen = key.as_bytes().len();
+        if keylen == 0 {
+            anyhow::bail!("xattr name cannot be empty");
+        }
         if keylen > XATTR_NAME_MAX {
             anyhow::bail!("xattr name too long; max={XATTR_NAME_MAX} found={keylen}");
         }
@@ -437,6 +447,11 @@ impl<'p> Entry<'p> {
                 FileType::RegularFile => {
                     Self::check_rdev(rdev)?;
                     if let Some(path) = payload.as_ref() {
+                        if size > DUMPFILE_NONINLINE_SIZE_MAX {
+                            anyhow::bail!(
+                                "Non-inline file size {size} exceeds maximum {DUMPFILE_NONINLINE_SIZE_MAX}"
+                            );
+                        }
                         let path = unescape_to_path(path)?;
                         Item::Regular {
                             size,
@@ -448,6 +463,11 @@ impl<'p> Entry<'p> {
                         // A dumpfile entry with no backing path or payload is treated as an empty file
                         let content = content.unwrap_or_default();
                         let content = unescape_limited(content, MAX_INLINE_CONTENT)?;
+                        if content.is_empty() && size > DUMPFILE_NONINLINE_SIZE_MAX {
+                            anyhow::bail!(
+                                "Non-inline file size {size} exceeds maximum {DUMPFILE_NONINLINE_SIZE_MAX}"
+                            );
+                        }
                         if fsverity_digest.is_some() {
                             anyhow::bail!("Inline file cannot have fsverity digest");
                         }
@@ -854,6 +874,72 @@ mod tests {
         let v = Xattr::parse("security.selinux=bar\x00").unwrap();
         similar_asserts::assert_eq!(v.key.as_bytes(), b"security.selinux");
         similar_asserts::assert_eq!(&*v.value, b"bar\0");
+    }
+
+    #[test]
+    fn test_corpus_limits() {
+        let cases = [
+            (
+                "empty xattr key",
+                "/ 4096 40755 2 0 0 0 0.0 - - - =somevalue",
+                Some("xattr name cannot be empty"),
+            ),
+            (
+                "empty xattr value",
+                "/ 4096 40755 2 0 0 0 0.0 - - - user.empty=",
+                None,
+            ),
+            (
+                "too big sparse file",
+                "/bigfile 9500000000000000 100777 1 0 0 0 0.0 - - -",
+                Some("Non-inline file size"),
+            ),
+        ];
+        for (name, line, error) in cases {
+            let result = Entry::parse(line);
+            match error {
+                Some(error) => assert!(result.unwrap_err().to_string().contains(error), "{name}"),
+                None => {
+                    result.unwrap();
+                }
+            }
+        }
+
+        // Count decoded bytes, including unescaped multi-byte characters.
+        for len in [255, 256, 257, 512, 513] {
+            for byte in ["a", r"\x00", "é"] {
+                let content = byte.repeat(len);
+                let size = if byte == "é" { len * 2 } else { len };
+                let line = format!("/inline {size} 100644 1 0 0 0 0.0 - {content} -");
+                let result = Entry::parse(&line);
+                assert_eq!(
+                    result.is_ok(),
+                    size <= MAX_INLINE_CONTENT,
+                    "len={len} byte={byte}"
+                );
+                if let Ok(entry) = result {
+                    let Item::RegularInline { content, .. } = entry.item else {
+                        panic!("expected inline file")
+                    };
+                    assert_eq!(content.len(), size);
+                }
+            }
+        }
+
+        for payload in ["-", "00/0123456789abcdef"] {
+            for size in [
+                DUMPFILE_NONINLINE_SIZE_MAX,
+                DUMPFILE_NONINLINE_SIZE_MAX + 1,
+                u64::MAX,
+            ] {
+                let line = format!("/file {size} 100644 1 0 0 0 0.0 {payload} - -");
+                assert_eq!(
+                    Entry::parse(&line).is_ok(),
+                    size <= DUMPFILE_NONINLINE_SIZE_MAX,
+                    "{line}"
+                );
+            }
+        }
     }
 
     #[test]
