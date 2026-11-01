@@ -75,6 +75,13 @@
 //! an exclusive lock. This ensures GC cannot run while other processes have the
 //! repository open.
 //!
+//! Long-lived servers can instead open with
+//! [`Repository::open_path_deferred_lock`], which holds no lock while idle:
+//! each operation takes a [`RepositoryLockGuard`] from
+//! [`Repository::try_lock_shared`], and [`Repository::gc`] takes the exclusive
+//! lock on a fresh file description. Both fail with [`RepositoryBusy`] instead
+//! of blocking.
+//!
 //! For more details, see the [repository design documentation](../../../doc/repository.md).
 
 use std::{
@@ -129,6 +136,63 @@ pub const REPO_METADATA_FILENAME: &str = "meta.json";
 pub struct ImageNotFound {
     /// The name/ref that was not found.
     pub name: String,
+}
+
+/// Error marker indicating that a non-blocking repository lock could not be
+/// taken because a conflicting lock is held (e.g. GC in another process).
+#[derive(Debug, thiserror::Error)]
+#[error("repository is busy: a conflicting lock is held")]
+pub struct RepositoryBusy;
+
+/// The shared-lock state of a repository opened with
+/// [`Repository::open_path_deferred_lock`].
+///
+/// The lock lives on its own file description so that it is unaffected by the
+/// repository fd and by the fresh description [`Repository::gc`] locks.
+#[derive(Debug)]
+struct DeferredLock {
+    fd: OwnedFd,
+    /// Number of live [`RepositoryLockGuard`]s; the flock is held while
+    /// non-zero.
+    holders: std::sync::Mutex<usize>,
+}
+
+impl DeferredLock {
+    fn holders(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A shared lock on a repository, taken with [`Repository::try_lock_shared`].
+///
+/// Guards on the same repository share one flock, which is released when the
+/// last guard is dropped. Cloning takes another reference to the same lock.
+#[derive(Debug)]
+pub struct RepositoryLockGuard(Option<Arc<DeferredLock>>);
+
+impl Clone for RepositoryLockGuard {
+    fn clone(&self) -> Self {
+        if let Some(lock) = &self.0 {
+            *lock.holders() += 1;
+        }
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for RepositoryLockGuard {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.0 {
+            let mut holders = lock.holders();
+            *holders -= 1;
+            if *holders == 0
+                && let Err(e) = flock(&lock.fd, FlockOperation::Unlock)
+            {
+                log::warn!("repository unlock failed: {e}");
+            }
+        }
+    }
 }
 
 /// Errors that can occur when opening a repository.
@@ -1027,6 +1091,9 @@ pub(crate) struct WritableRepo;
 /// garbage collection.
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
+    /// Set when opened with [`Self::open_path_deferred_lock`]; `None` means
+    /// `repository` holds a shared lock for the lifetime of this value.
+    deferred_lock: Option<Arc<DeferredLock>>,
     objects: OnceCell<OwnedFd>,
     images: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
@@ -1514,12 +1581,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         dirfd: impl AsFd,
         path: impl AsRef<Path>,
     ) -> Result<Self, RepositoryOpenError> {
-        let path = path.as_ref();
+        Self::open_path_impl(dirfd, path.as_ref(), false)
+    }
 
+    /// Like [`open_path`](Self::open_path), but take no lock until one is
+    /// requested.
+    ///
+    /// For long-lived servers, where a lock held while idle would starve GC.
+    /// The caller must hold a guard from
+    /// [`try_lock_shared`](Self::try_lock_shared) around every operation
+    /// except [`gc`](Self::gc) and [`gc_dry_run`](Self::gc_dry_run), which
+    /// lock on their own and fail with [`RepositoryBusy`] rather than block.
+    pub fn open_path_deferred_lock(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, RepositoryOpenError> {
+        Self::open_path_impl(dirfd, path.as_ref(), true)
+    }
+
+    fn open_path_impl(
+        dirfd: impl AsFd,
+        path: &Path,
+        deferred_lock: bool,
+    ) -> Result<Self, RepositoryOpenError> {
         // O_PATH isn't enough because flock()
         let repository = openat(dirfd, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
 
-        flock(&repository, FlockOperation::LockShared)?;
+        let deferred_lock = if deferred_lock {
+            Some(Arc::new(DeferredLock {
+                fd: Self::reopen_dir(&repository)?,
+                holders: std::sync::Mutex::new(0),
+            }))
+        } else {
+            flock(&repository, FlockOperation::LockShared)?;
+            None
+        };
 
         // Read, parse, and validate meta.json up front so that broken
         // or incompatible metadata is caught immediately rather than
@@ -1529,6 +1625,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         Ok(Self {
             repository,
+            deferred_lock,
             objects: OnceCell::new(),
             images: OnceCell::new(),
             write_semaphore: OnceCell::new(),
@@ -1557,9 +1654,24 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns `(repo, upgraded)` where `upgraded` is true if `meta.json`
     /// was written.
     pub fn open_upgrade(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<(Self, bool)> {
-        let path = path.as_ref();
+        Self::open_upgrade_impl(dirfd, path.as_ref(), false)
+    }
 
-        match Self::open_path(&dirfd, path) {
+    /// Like [`open_upgrade`](Self::open_upgrade), but open with
+    /// [`open_path_deferred_lock`](Self::open_path_deferred_lock).
+    pub fn open_upgrade_deferred_lock(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, bool)> {
+        Self::open_upgrade_impl(dirfd, path.as_ref(), true)
+    }
+
+    fn open_upgrade_impl(
+        dirfd: impl AsFd,
+        path: &Path,
+        deferred_lock: bool,
+    ) -> Result<(Self, bool)> {
+        match Self::open_path_impl(&dirfd, path, deferred_lock) {
             Ok(repo) => Ok((repo, false)),
             Err(RepositoryOpenError::OldFormatRepository) => {
                 let repo_fd = openat(
@@ -1589,7 +1701,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
                 drop(repo_fd);
 
-                let repo = Self::open_path(&dirfd, path)
+                let repo = Self::open_path_impl(&dirfd, path, deferred_lock)
                     .context("opening repository after writing meta.json")?;
 
                 Ok((repo, true))
@@ -1699,6 +1811,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .is_some();
 
         Ok((meta, has_verity))
+    }
+
+    /// Open a new file description for the repository directory, so a flock
+    /// on it is independent of any lock on `repository`.
+    fn reopen_dir(repository: &OwnedFd) -> ErrnoResult<OwnedFd> {
+        openat(
+            repository,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    }
+
+    /// Take a non-blocking shared lock for the duration of an operation.
+    ///
+    /// On a repository opened with
+    /// [`open_path_deferred_lock`](Self::open_path_deferred_lock), the first
+    /// live guard takes the flock and the last one releases it; fails with
+    /// [`RepositoryBusy`] while an exclusive lock is held. On any other
+    /// repository the shared lock is already held, and the guard is a no-op.
+    pub fn try_lock_shared(&self) -> Result<RepositoryLockGuard> {
+        let Some(lock) = &self.deferred_lock else {
+            return Ok(RepositoryLockGuard(None));
+        };
+        let mut holders = lock.holders();
+        if *holders == 0 {
+            match flock(&lock.fd, FlockOperation::NonBlockingLockShared) {
+                Ok(()) => {}
+                Err(Errno::WOULDBLOCK) => return Err(RepositoryBusy.into()),
+                Err(e) => return Err(e).context("Acquiring shared repository lock"),
+            }
+        }
+        *holders += 1;
+        Ok(RepositoryLockGuard(Some(Arc::clone(lock))))
     }
 
     /// Open the default user-owned composefs repository.
@@ -3274,12 +3420,38 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
+    ///
+    /// On a repository opened with
+    /// [`open_path_deferred_lock`](Self::open_path_deferred_lock), the lock is
+    /// taken without blocking on a fresh file description (converting a held
+    /// shared lock could lose it on failure), and [`RepositoryBusy`] is
+    /// returned if any other lock, including a live [`RepositoryLockGuard`],
+    /// is held.
     #[context("Running garbage collection")]
     pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
         self.ensure_writable_token()?;
+        if self.deferred_lock.is_some() {
+            let lock_fd =
+                Self::reopen_dir(&self.repository).context("Reopening repository for GC")?;
+            match flock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(Errno::WOULDBLOCK) => return Err(RepositoryBusy.into()),
+                Err(e) => return Err(e).context("Acquiring exclusive lock for GC"),
+            }
+            let result = self.gc_impl(additional_roots, false);
+            // Unlock explicitly rather than on close: a child forked meanwhile
+            // shares the file description and would keep it locked.
+            if let Err(e) = flock(&lock_fd, FlockOperation::Unlock) {
+                log::warn!("repository unlock after GC failed: {e}");
+            }
+            return result;
+        }
         flock(&self.repository, FlockOperation::LockExclusive)
             .context("Acquiring exclusive lock for GC")?;
-        self.gc_impl(additional_roots, false)
+        let result = self.gc_impl(additional_roots, false)?;
+        flock(&self.repository, FlockOperation::LockShared)
+            .context("Downgrading to shared lock after GC")?;
+        Ok(result)
     }
 
     /// Preview what garbage collection would remove, without deleting.
@@ -3290,12 +3462,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// A shared lock is held for the duration of this operation (readers
-    /// are not blocked).
+    /// are not blocked). On a repository opened with
+    /// [`open_path_deferred_lock`](Self::open_path_deferred_lock) it is taken
+    /// with [`try_lock_shared`](Self::try_lock_shared).
     #[context("Running garbage collection dry run")]
     pub fn gc_dry_run(&self, additional_roots: &[&str]) -> Result<GcResult> {
         // Shared lock is sufficient since we don't modify anything
-        flock(&self.repository, FlockOperation::LockShared)
-            .context("Acquiring shared lock for GC dry run")?;
+        let _guard = if self.deferred_lock.is_some() {
+            self.try_lock_shared()?
+        } else {
+            flock(&self.repository, FlockOperation::LockShared)
+                .context("Acquiring shared lock for GC dry run")?;
+            RepositoryLockGuard(None)
+        };
         self.gc_impl(additional_roots, true)
     }
 
@@ -3415,11 +3594,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .cleanup_gc_category("streams", dry_run)
             .context("Cleaning up broken stream symlinks")?;
 
-        // Downgrade to shared lock if we had exclusive (for actual GC)
-        if !dry_run {
-            flock(&self.repository, FlockOperation::LockShared)
-                .context("Downgrading to shared lock after GC")?;
-        }
         Ok(result)
     }
 
@@ -4218,6 +4392,38 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.streams_pruned, 1);
         assert_eq!(result.images_pruned, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_deferred_lock_gc_busy() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+        drop(create_test_repo(&path)?);
+        let is_busy = |r: Result<GcResult>| r.is_err_and(|e| e.is::<RepositoryBusy>());
+
+        let a = Repository::<Sha512HashValue>::open_path_deferred_lock(CWD, &path)?;
+        let b = Repository::<Sha512HashValue>::open_path_deferred_lock(CWD, &path)?;
+        // Idle deferred handles hold no lock.
+        a.gc(&[])?;
+
+        // Guards share one lock that is released with the last of them.
+        let guard = a.try_lock_shared()?;
+        let guard2 = guard.clone();
+        assert!(is_busy(b.gc(&[])));
+        assert!(is_busy(a.gc(&[])), "GC must not convert a held lock");
+        drop(guard);
+        assert!(is_busy(b.gc(&[])));
+        // A dry run only needs a shared lock.
+        b.gc_dry_run(&[])?;
+        drop(guard2);
+        b.gc(&[])?;
+
+        // A blocking open holds its shared lock for its lifetime.
+        let locked = Repository::<Sha512HashValue>::open_path(CWD, &path)?;
+        assert!(is_busy(a.gc(&[])));
+        drop(locked);
+        a.gc(&[])?;
         Ok(())
     }
 

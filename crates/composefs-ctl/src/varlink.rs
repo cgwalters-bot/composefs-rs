@@ -13,6 +13,13 @@
 //! open time, wrapped in an `Arc` so the streaming `Pull` method can move an
 //! owned clone into its `'static` reply stream.
 //!
+//! An open handle holds no repository lock while idle, so it does not block
+//! GC by this or any other process. Each call takes a non-blocking shared lock
+//! for its duration (`Pull` until its task ends, `GetLayer` until its producer
+//! and the client's keepalive fd are done), and `Gc` takes a non-blocking
+//! exclusive lock; on contention the call fails with `Busy` rather than
+//! blocking the server.
+//!
 //! The zlink server serializes `Service::handle` calls (a single task holds
 //! one `&mut self` borrow at a time), so the handle table is a plain
 //! `HashMap` with no interior locking.
@@ -23,7 +30,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use composefs::fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue};
-use composefs::repository::{FsckResult, Repository, RepositoryConfig, system_path, user_path};
+use composefs::repository::{
+    FsckResult, Repository, RepositoryBusy, RepositoryConfig, RepositoryLockGuard, system_path,
+    user_path,
+};
 use rustix::fs::CWD;
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +144,25 @@ pub enum RepositoryError {
         /// Description of the failure.
         message: String,
     },
+    /// The repository is locked by a conflicting operation (e.g. GC, or a
+    /// call in progress when GC was requested); retry later.
+    Busy {
+        /// Description of the conflict.
+        message: String,
+    },
+}
+
+impl RepositoryError {
+    /// Map a repository error to [`Self::Busy`] if it is a lock conflict,
+    /// otherwise to [`Self::InternalError`].
+    fn from_repo(e: anyhow::Error) -> Self {
+        let message = format!("{e:#}");
+        if e.is::<RepositoryBusy>() {
+            Self::Busy { message }
+        } else {
+            Self::InternalError { message }
+        }
+    }
 }
 
 /// Reply carrying an opaque repository handle and basic repository metadata.
@@ -221,6 +250,35 @@ impl OpenRepo {
             OpenRepo::Sha256(r) => r.objects_dir().ok().and_then(stat_it),
             OpenRepo::Sha512(r) => r.objects_dir().ok().and_then(stat_it),
         }
+    }
+
+    /// Take a non-blocking shared lock for the duration of one call.
+    fn lock(self) -> Result<LockedRepo> {
+        let lock = match &self {
+            OpenRepo::Sha256(r) => r.try_lock_shared(),
+            OpenRepo::Sha512(r) => r.try_lock_shared(),
+        }?;
+        Ok(LockedRepo { repo: self, lock })
+    }
+}
+
+/// An [`OpenRepo`] holding a shared repository lock, released on drop.
+///
+/// Call sites match on `*self.lookup_repo(handle)?`, so the temporary (and
+/// with it the lock) lives until the end of the `match`.
+#[derive(Debug)]
+pub(crate) struct LockedRepo {
+    repo: OpenRepo,
+    /// Held for its `Drop`; streaming OCI calls clone it into their producer.
+    #[cfg_attr(not(feature = "oci"), allow(dead_code))]
+    lock: RepositoryLockGuard,
+}
+
+impl std::ops::Deref for LockedRepo {
+    type Target = OpenRepo;
+
+    fn deref(&self) -> &OpenRepo {
+        &self.repo
     }
 }
 
@@ -347,27 +405,37 @@ impl CfsctlService {
         self.next_handle
     }
 
-    /// Look up an open repository by handle for the Repository interface.
+    /// Look up an open repository by handle without locking it.
     ///
     /// Returns an owned [`OpenRepo`] (a cheap `Arc` clone) so callers do not
-    /// hold a borrow of `self` across the subsequent `.await`.
-    fn lookup_repo(&self, handle: u64) -> std::result::Result<OpenRepo, RepositoryError> {
+    /// hold a borrow of `self` across the subsequent `.await`. Only for `Gc`,
+    /// which locks on its own; everything else uses [`Self::lookup_repo`].
+    fn lookup_unlocked(&self, handle: u64) -> std::result::Result<OpenRepo, RepositoryError> {
         self.repos
             .get(&handle)
             .map(|entry| entry.repo.clone())
             .ok_or(RepositoryError::InvalidHandle { handle })
     }
 
+    /// Look up an open repository by handle for the Repository interface and
+    /// take a shared lock on it for the duration of the call.
+    fn lookup_repo(&self, handle: u64) -> std::result::Result<LockedRepo, RepositoryError> {
+        self.lookup_unlocked(handle)?.lock().map_err(RepositoryError::from_repo)
+    }
+
     /// Look up an open repository by handle for the OCI interface.
     ///
-    /// Like [`Self::lookup_repo`] but reports the OCI-interface error so the
-    /// wire error name is `org.composefs.Oci.InvalidHandle`.
+    /// Like [`Self::lookup_repo`] but reports the OCI-interface errors so the
+    /// wire error names are `org.composefs.Oci.InvalidHandle` and
+    /// `org.composefs.Oci.Busy`.
     #[cfg(feature = "oci")]
-    fn lookup_oci(&self, handle: u64) -> std::result::Result<OpenRepo, oci::OciError> {
+    fn lookup_oci(&self, handle: u64) -> std::result::Result<LockedRepo, oci::OciError> {
         self.repos
             .get(&handle)
             .map(|entry| entry.repo.clone())
-            .ok_or(oci::OciError::InvalidHandle { handle })
+            .ok_or(oci::OciError::InvalidHandle { handle })?
+            .lock()
+            .map_err(oci::OciError::from_repo)
     }
 
     /// Resolve, open and register a repository at `path`, returning the reply
@@ -393,6 +461,7 @@ impl CfsctlService {
                     self.open_opts.insecure,
                     self.open_opts.require_verity,
                     self.open_opts.no_upgrade,
+                    true,
                 )
                 .map_err(|e| RepositoryError::RepoNotFound {
                     message: format!("{e:#}"),
@@ -404,6 +473,7 @@ impl CfsctlService {
                     self.open_opts.insecure,
                     self.open_opts.require_verity,
                     self.open_opts.no_upgrade,
+                    true,
                 )
                 .map_err(|e| RepositoryError::RepoNotFound {
                     message: format!("{e:#}"),
@@ -472,9 +542,7 @@ async fn run_gc<ObjectID: FsVerityHashValue>(
     } else {
         repo.gc(&root_refs)
     }
-    .map_err(|e| RepositoryError::InternalError {
-        message: format!("{e:#}"),
-    })?;
+    .map_err(RepositoryError::from_repo)?;
     Ok(GcReply { result, dry_run })
 }
 
@@ -1023,7 +1091,7 @@ mod service_impl {
             metadata_only: Option<bool>,
         ) -> std::result::Result<FsckReply, RepositoryError> {
             let metadata_only = metadata_only.unwrap_or(false);
-            let result = match self.lookup_repo(handle)? {
+            let result = match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_fsck::<Sha256HashValue>(r, metadata_only).await,
                 OpenRepo::Sha512(ref r) => run_fsck::<Sha512HashValue>(r, metadata_only).await,
             }?;
@@ -1037,7 +1105,8 @@ mod service_impl {
             dry_run: bool,
             roots: Vec<String>,
         ) -> std::result::Result<GcReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            // Unlocked: GC takes its own lock and replies `Busy` on conflict.
+            match self.lookup_unlocked(handle)? {
                 OpenRepo::Sha256(ref r) => run_gc::<Sha256HashValue>(r, dry_run, roots).await,
                 OpenRepo::Sha512(ref r) => run_gc::<Sha512HashValue>(r, dry_run, roots).await,
             }
@@ -1049,7 +1118,7 @@ mod service_impl {
             handle: u64,
             name: String,
         ) -> std::result::Result<ImageObjectsReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
                 OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
             }
@@ -1060,7 +1129,7 @@ mod service_impl {
             &self,
             handle: u64,
         ) -> std::result::Result<ListImageRefsReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_list_image_refs::<Sha256HashValue>(r),
                 OpenRepo::Sha512(ref r) => run_list_image_refs::<Sha512HashValue>(r),
             }
@@ -1082,15 +1151,10 @@ mod service_impl {
             std::result::Result<MountReply, RepositoryError>,
             Vec<std::os::fd::OwnedFd>,
         ) {
-            let result = match self.lookup_repo(handle) {
-                Ok(OpenRepo::Sha256(ref r)) => {
-                    run_mount::<Sha256HashValue>(r, &name, &options, fds)
-                }
-                Ok(OpenRepo::Sha512(ref r)) => {
-                    run_mount::<Sha512HashValue>(r, &name, &options, fds)
-                }
-                Err(e) => Err(e),
-            };
+            let result = self.lookup_repo(handle).and_then(|locked| match *locked {
+                OpenRepo::Sha256(ref r) => run_mount::<Sha256HashValue>(r, &name, &options, fds),
+                OpenRepo::Sha512(ref r) => run_mount::<Sha512HashValue>(r, &name, &options, fds),
+            });
             match result {
                 Ok((reply, fds)) => (Ok(reply), fds),
                 Err(e) => (Err(e), vec![]),
@@ -1112,7 +1176,7 @@ mod service_impl {
     };
     use super::oci::{
         ListImagesReply, OciComputeIdReply, OciError, OciFsckReply, OciInspectReply, PullProgress,
-        parse_local_fetch, pull_stream,
+        PullStream, parse_local_fetch, pull_stream,
     };
     use super::{
         CfsctlService, EnsureRepositoryReply, FsckReply, GcReply, ImageObjectsReply,
@@ -1123,7 +1187,8 @@ mod service_impl {
         run_tag, run_untag,
     };
     use composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
-    use composefs_oci::layer_transport::{RepoLayerSource, serve_get_layer};
+    use composefs::repository::RepositoryLockGuard;
+    use composefs_oci::layer_transport::{LayerSource, RepoLayerSource, serve_get_layer};
     use composefs_oci::varlink_types::GetLayerParams;
     use composefs_splitdirfdstream::seed_from_id;
 
@@ -1220,7 +1285,7 @@ mod service_impl {
             metadata_only: Option<bool>,
         ) -> std::result::Result<FsckReply, RepositoryError> {
             let metadata_only = metadata_only.unwrap_or(false);
-            let result = match self.lookup_repo(handle)? {
+            let result = match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_fsck::<Sha256HashValue>(r, metadata_only).await,
                 OpenRepo::Sha512(ref r) => run_fsck::<Sha512HashValue>(r, metadata_only).await,
             }?;
@@ -1234,7 +1299,8 @@ mod service_impl {
             dry_run: bool,
             roots: Vec<String>,
         ) -> std::result::Result<GcReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            // Unlocked: GC takes its own lock and replies `Busy` on conflict.
+            match self.lookup_unlocked(handle)? {
                 OpenRepo::Sha256(ref r) => run_gc::<Sha256HashValue>(r, dry_run, roots).await,
                 OpenRepo::Sha512(ref r) => run_gc::<Sha512HashValue>(r, dry_run, roots).await,
             }
@@ -1246,7 +1312,7 @@ mod service_impl {
             handle: u64,
             name: String,
         ) -> std::result::Result<ImageObjectsReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
                 OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
             }
@@ -1257,7 +1323,7 @@ mod service_impl {
             &self,
             handle: u64,
         ) -> std::result::Result<ListImageRefsReply, RepositoryError> {
-            match self.lookup_repo(handle)? {
+            match *self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_list_image_refs::<Sha256HashValue>(r),
                 OpenRepo::Sha512(ref r) => run_list_image_refs::<Sha512HashValue>(r),
             }
@@ -1279,15 +1345,10 @@ mod service_impl {
             std::result::Result<MountReply, RepositoryError>,
             Vec<std::os::fd::OwnedFd>,
         ) {
-            let result = match self.lookup_repo(handle) {
-                Ok(OpenRepo::Sha256(ref r)) => {
-                    run_mount::<Sha256HashValue>(r, &name, &options, fds)
-                }
-                Ok(OpenRepo::Sha512(ref r)) => {
-                    run_mount::<Sha512HashValue>(r, &name, &options, fds)
-                }
-                Err(e) => Err(e),
-            };
+            let result = self.lookup_repo(handle).and_then(|locked| match *locked {
+                OpenRepo::Sha256(ref r) => run_mount::<Sha256HashValue>(r, &name, &options, fds),
+                OpenRepo::Sha512(ref r) => run_mount::<Sha512HashValue>(r, &name, &options, fds),
+            });
             match result {
                 Ok((reply, fds)) => (Ok(reply), fds),
                 Err(e) => (Err(e), vec![]),
@@ -1310,7 +1371,7 @@ mod service_impl {
             handle: u64,
             filter: Option<String>,
         ) -> std::result::Result<ListImagesReply, OciError> {
-            let images = match self.lookup_oci(handle)? {
+            let images = match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => run_list_images::<Sha256HashValue>(r, filter).await,
                 OpenRepo::Sha512(ref r) => run_list_images::<Sha512HashValue>(r, filter).await,
             }?;
@@ -1328,7 +1389,7 @@ mod service_impl {
             handle: u64,
             image: Option<String>,
         ) -> std::result::Result<OciFsckReply, OciError> {
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => run_oci_fsck::<Sha256HashValue>(r, image).await,
                 OpenRepo::Sha512(ref r) => run_oci_fsck::<Sha512HashValue>(r, image).await,
             }
@@ -1341,7 +1402,7 @@ mod service_impl {
             handle: u64,
             image: String,
         ) -> std::result::Result<OciInspectReply, OciError> {
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => run_inspect::<Sha256HashValue>(r, image).await,
                 OpenRepo::Sha512(ref r) => run_inspect::<Sha512HashValue>(r, image).await,
             }
@@ -1355,7 +1416,7 @@ mod service_impl {
             manifest_digest: String,
             name: String,
         ) -> std::result::Result<(), OciError> {
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
                     run_tag::<Sha256HashValue>(r, manifest_digest, name).await
                 }
@@ -1368,7 +1429,7 @@ mod service_impl {
         /// Remove a tag.
         #[zlink(interface = "org.composefs.Oci")]
         async fn untag(&self, handle: u64, name: String) -> std::result::Result<(), OciError> {
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => run_untag::<Sha256HashValue>(r, name).await,
                 OpenRepo::Sha512(ref r) => run_untag::<Sha512HashValue>(r, name).await,
             }
@@ -1384,7 +1445,7 @@ mod service_impl {
             bootable: bool,
             xattrs: Option<composefs_oci::XattrFiltering>,
         ) -> std::result::Result<OciComputeIdReply, OciError> {
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
                     run_compute_id::<Sha256HashValue>(r, image, verity, bootable, xattrs).await
                 }
@@ -1426,39 +1487,43 @@ mod service_impl {
         > {
             let lf = parse_local_fetch(&local_fetch);
             let sr = storage_root.map(std::path::PathBuf::from);
-            // Resolve the handle synchronously and clone an owned Arc out so the
-            // returned stream owns everything it needs ('static). On a missing
-            // handle, yield a one-shot error stream (`pull_stream` and the
-            // error path share the same boxed-trait-object return type).
-            match self.repos.get(&handle).map(|entry| &entry.repo) {
-                Some(OpenRepo::Sha256(r)) => pull_stream::<Sha256HashValue>(
-                    r.clone(),
-                    image,
-                    name,
-                    lf,
-                    sr,
-                    bootable,
-                    xattrs,
-                    expected_digest,
-                    more,
-                ),
-                Some(OpenRepo::Sha512(r)) => pull_stream::<Sha512HashValue>(
-                    r.clone(),
-                    image,
-                    name,
-                    lf,
-                    sr,
-                    bootable,
-                    xattrs,
-                    expected_digest,
-                    more,
-                ),
-                None => {
+            // Resolve the handle synchronously and clone an owned Arc and lock
+            // out so the returned stream owns everything it needs ('static). On
+            // a missing handle or lock conflict, yield a one-shot error stream
+            // (`pull_stream` and the error path share the same
+            // boxed-trait-object return type).
+            let locked = match self.lookup_oci(handle) {
+                Ok(locked) => locked,
+                Err(e) => {
                     use zlink::futures_util::stream;
-                    Box::pin(stream::once(async move {
-                        Err(OciError::InvalidHandle { handle })
-                    }))
+                    return Box::pin(stream::once(async move { Err(e) })) as PullStream;
                 }
+            };
+            match *locked {
+                OpenRepo::Sha256(ref r) => pull_stream::<Sha256HashValue>(
+                    r.clone(),
+                    locked.lock.clone(),
+                    image,
+                    name,
+                    lf,
+                    sr,
+                    bootable,
+                    xattrs,
+                    expected_digest,
+                    more,
+                ),
+                OpenRepo::Sha512(ref r) => pull_stream::<Sha512HashValue>(
+                    r.clone(),
+                    locked.lock.clone(),
+                    image,
+                    name,
+                    lf,
+                    sr,
+                    bootable,
+                    xattrs,
+                    expected_digest,
+                    more,
+                ),
             }
         }
 
@@ -1480,15 +1545,14 @@ mod service_impl {
             std::result::Result<MountReply, OciError>,
             Vec<std::os::fd::OwnedFd>,
         ) {
-            let result = match self.lookup_oci(handle) {
-                Ok(OpenRepo::Sha256(ref r)) => {
+            let result = self.lookup_oci(handle).and_then(|locked| match *locked {
+                OpenRepo::Sha256(ref r) => {
                     run_oci_mount::<Sha256HashValue>(r, &image, bootable, &options, fds)
                 }
-                Ok(OpenRepo::Sha512(ref r)) => {
+                OpenRepo::Sha512(ref r) => {
                     run_oci_mount::<Sha512HashValue>(r, &image, bootable, &options, fds)
                 }
-                Err(e) => Err(e),
-            };
+            });
             match result {
                 Ok((reply, fds)) => (Ok(reply), fds),
                 Err(e) => (Err(e), vec![]),
@@ -1547,7 +1611,7 @@ mod service_impl {
                 }
             }
 
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => check::<Sha256HashValue>(r, &content_id),
                 OpenRepo::Sha512(ref r) => check::<Sha512HashValue>(r, &content_id),
             }
@@ -1572,8 +1636,8 @@ mod service_impl {
         /// `more=true`).
         ///
         /// The producer runs on `spawn_blocking` so the async task is never blocked.
-        /// For the repo case there is no external lock to release, so `keepalive_read`
-        /// is moved into the producer closure and dropped when the producer finishes.
+        /// The repository's shared lock is held until both the producer and the
+        /// client's keepalive are done.
         #[zlink(interface = "org.composefs.Oci", more, return_fds)]
         async fn get_layer(
             &self,
@@ -1619,8 +1683,33 @@ mod service_impl {
             let content_id = composefs_oci::layer_content_id(&diff_id_parsed);
 
             // ── Drive serve_get_layer via the LayerSource trait ───────────────
+            /// A [`RepoLayerSource`] that holds the repository lock until both the
+            /// producer and the client's keepalive are done.
+            struct LockedLayerSource<ObjectID: FsVerityHashValue> {
+                inner: RepoLayerSource<ObjectID>,
+                lock: RepositoryLockGuard,
+            }
+
+            impl<ObjectID: FsVerityHashValue> LayerSource for LockedLayerSource<ObjectID> {
+                fn open(
+                    &self,
+                ) -> anyhow::Result<(Vec<std::os::fd::OwnedFd>, Box<dyn Send + 'static>)> {
+                    let (fds, guard) = self.inner.open()?;
+                    Ok((fds, Box::new((guard, self.lock.clone()))))
+                }
+
+                fn produce(
+                    &self,
+                    dirfd_index_map: &[u32],
+                    out: Box<dyn std::io::Write + Send>,
+                ) -> anyhow::Result<()> {
+                    self.inner.produce(dirfd_index_map, out)
+                }
+            }
+
             fn do_serve_get_layer<ObjectID: FsVerityHashValue>(
                 repo: &std::sync::Arc<composefs::repository::Repository<ObjectID>>,
+                lock: RepositoryLockGuard,
                 content_id: &str,
                 diff_id_str: &str,
                 more: bool,
@@ -1636,9 +1725,12 @@ mod service_impl {
                     })?;
 
                 let seed = seed_from_id(content_id);
-                let source = RepoLayerSource {
-                    repo: repo.clone(),
-                    layer_verity: verity,
+                let source = LockedLayerSource {
+                    inner: RepoLayerSource {
+                        repo: repo.clone(),
+                        layer_verity: verity,
+                    },
+                    lock,
                 };
 
                 serve_get_layer(source, seed, more).map_err(|e| match e {
@@ -1656,15 +1748,17 @@ mod service_impl {
                 })
             }
 
-            let frames = match self.lookup_oci(handle) {
-                Ok(OpenRepo::Sha256(ref r)) => {
-                    do_serve_get_layer::<Sha256HashValue>(r, &content_id, &diff_id, more)
+            let frames = self.lookup_oci(handle).and_then(|locked| {
+                let lock = locked.lock.clone();
+                match *locked {
+                    OpenRepo::Sha256(ref r) => {
+                        do_serve_get_layer::<Sha256HashValue>(r, lock, &content_id, &diff_id, more)
+                    }
+                    OpenRepo::Sha512(ref r) => {
+                        do_serve_get_layer::<Sha512HashValue>(r, lock, &content_id, &diff_id, more)
+                    }
                 }
-                Ok(OpenRepo::Sha512(ref r)) => {
-                    do_serve_get_layer::<Sha512HashValue>(r, &content_id, &diff_id, more)
-                }
-                Err(e) => Err(e),
-            };
+            });
 
             let frames = match frames {
                 Ok(f) => f,
@@ -1730,7 +1824,7 @@ mod service_impl {
             // Check whether the layer is already present (for the reply flag).
             // We still proceed with the drain regardless to avoid wedging the
             // client's writer if it is already producing.
-            let already_present = match self.lookup_oci(handle)? {
+            let already_present = match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => r
                     .has_stream(&content_id)
                     .map_err(|e| OciError::InternalError {
@@ -1793,7 +1887,7 @@ mod service_impl {
                 })
             }
 
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
                     run_put_layer::<Sha256HashValue>(
                         r.clone(),
@@ -1892,7 +1986,7 @@ mod service_impl {
                 })
             }
 
-            match self.lookup_oci(handle)? {
+            match *self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
                     run_finalize::<Sha256HashValue>(
                         r.clone(),
@@ -2510,6 +2604,13 @@ pub mod oci {
         }
     }
 
+    /// One reply of the `Pull` method.
+    type PullReply = std::result::Result<zlink::Reply<PullProgress>, OciError>;
+
+    /// The reply stream of the `Pull` method.
+    pub(crate) type PullStream =
+        std::pin::Pin<Box<dyn zlink::futures_util::Stream<Item = PullReply>>>;
+
     /// Run a streaming pull against an already-opened repository, returning a
     /// boxed stream of [`PullProgress`] frames.
     ///
@@ -2531,9 +2632,12 @@ pub mod oci {
     /// contradictory requests); both are rejected up front with
     /// [`OciError::InvalidRequest`]. See [`want_bootable_pull`] for how the
     /// initial `pull()` call decides whether to also request the boot variant.
+    ///
+    /// `lock` is held by the pull task until it finishes or is aborted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pull_stream<ObjectID: FsVerityHashValue>(
         repo: Arc<Repository<ObjectID>>,
+        lock: RepositoryLockGuard,
         image: String,
         name: Option<String>,
         local_fetch: composefs_oci::LocalFetchOpt,
@@ -2542,13 +2646,7 @@ pub mod oci {
         xattrs: Option<composefs_oci::XattrFiltering>,
         expected_digest: Option<String>,
         more: bool,
-    ) -> std::pin::Pin<
-        Box<
-            dyn zlink::futures_util::Stream<
-                    Item = std::result::Result<zlink::Reply<PullProgress>, OciError>,
-                >,
-        >,
-    > {
+    ) -> PullStream {
         use zlink::futures_util::stream;
 
         if expected_digest.is_some() && !bootable {
@@ -2598,6 +2696,7 @@ pub mod oci {
         let task_tx = tx.clone();
         let use_bootable_opt = want_bootable_pull(bootable, expected_digest.is_some(), xattrs);
         let handle = tokio::task::spawn_local(async move {
+            let _lock = lock;
             let opts = composefs_oci::PullOptions {
                 local_fetch,
                 storage_root: storage_root.as_deref(),
@@ -2806,6 +2905,25 @@ pub mod oci {
             /// Number of (mode, version) combinations that were tried.
             tried: u64,
         },
+        /// The repository is locked by a conflicting operation (e.g. GC);
+        /// retry later.
+        Busy {
+            /// Description of the conflict.
+            message: String,
+        },
+    }
+
+    impl OciError {
+        /// Map a repository error to [`Self::Busy`] if it is a lock
+        /// conflict, otherwise to [`Self::InternalError`].
+        pub(crate) fn from_repo(e: anyhow::Error) -> Self {
+            let message = format!("{e:#}");
+            if e.is::<RepositoryBusy>() {
+                Self::Busy { message }
+            } else {
+                Self::InternalError { message }
+            }
+        }
     }
 }
 
@@ -3835,5 +3953,169 @@ mod layer_sync_tests {
             erofs.is_some(),
             "EROFS image must exist after finalize_image"
         );
+    }
+}
+
+#[cfg(all(test, feature = "oci"))]
+mod repository_lock_tests {
+    //! Open handles hold no lock while idle; lock conflicts reply `Busy`.
+
+    use std::io::BufRead as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use composefs::fsverity::Sha256HashValue;
+    use composefs::repository::{Repository, RepositoryConfig};
+    use rustix::fs::CWD;
+
+    use super::oci::OciError;
+    use super::proxy::{OciProxy as _, RepositoryProxy as _};
+    use super::{CfsctlService, OpenRepo, RepositoryError, run_gc, spawn_in_process};
+
+    type Client = zlink::tokio::unix::Connection;
+
+    const GC_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Create an insecure repository and close it again, so that it is not
+    /// left locked.
+    fn create_repo() -> (tempfile::TempDir, PathBuf) {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let path = tempdir.path().join("repo");
+        Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::default().set_insecure(),
+        )
+        .unwrap();
+        (tempdir, path)
+    }
+
+    async fn open(client: &mut Client, path: &Path) -> u64 {
+        client
+            .open_repository(Some(path.to_str().unwrap()), None, None)
+            .await
+            .unwrap()
+            .expect("open_repository")
+            .handle
+    }
+
+    /// Bounded, so that GC blocking on a lock again fails instead of hanging.
+    async fn gc(client: &mut Client, handle: u64) -> Result<(), RepositoryError> {
+        let reply = tokio::time::timeout(GC_TIMEOUT, client.gc(handle, false, vec![]))
+            .await
+            .expect("GC must not block on a lock")
+            .unwrap();
+        reply.map(|_| ())
+    }
+
+    fn open_deferred(path: &Path) -> Repository<Sha256HashValue> {
+        Repository::open_path_deferred_lock(CWD, path).unwrap()
+    }
+
+    fn is_busy<T>(reply: &Result<T, RepositoryError>) -> bool {
+        matches!(reply, Err(RepositoryError::Busy { .. }))
+    }
+
+    /// Hold an flock on `path` from a separate `flock(1)` process, returning
+    /// once the lock is taken. Killing the child releases it (`--no-fork`
+    /// leaves no grandchild holding the lock fd).
+    fn flock_in_child(path: &Path, mode: &str) -> Child {
+        let mut child = Command::new("flock")
+            .args(["--no-fork", "--timeout=30", mode])
+            .arg(path)
+            .args(["-c", "echo locked && exec sleep 600"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawning flock(1)");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        if line.trim() != "locked" {
+            release(child);
+            panic!("flock(1) did not take the lock (blocked, or lacks --no-fork)");
+        }
+        child
+    }
+
+    fn release(mut child: Child) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_handle_does_not_block_gc() {
+        let (_tempdir, path) = create_repo();
+        let (mut client, _server) = spawn_in_process(CfsctlService::insecure_for_test()).unwrap();
+
+        let a = open(&mut client, &path).await;
+        let _idle = open(&mut client, &path).await;
+        gc(&mut client, a).await.expect("GC with an idle second handle");
+
+        // GC by another opener is not blocked by the idle handles either.
+        let other = open_deferred(&path);
+        other.gc(&[]).expect("external GC with idle handles open");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_busy_while_call_on_same_handle_in_progress() {
+        let (_tempdir, path) = create_repo();
+        let mut service = CfsctlService::insecure_for_test();
+        let handle = service.do_open(&path, None).unwrap().handle;
+
+        let gc_handle = || match service.lookup_unlocked(handle).unwrap() {
+            OpenRepo::Sha256(r) => async move { run_gc(&r, false, vec![]).await },
+            OpenRepo::Sha512(_) => unreachable!("sha256 repository"),
+        };
+
+        // An in-flight call holds the handle's shared lock.
+        let call = service.lookup_repo(handle).unwrap();
+        assert!(is_busy(&gc_handle().await));
+        drop(call);
+        gc_handle().await.expect("GC after the call finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_busy_while_shared_lock_held() {
+        let (_tempdir, path) = create_repo();
+        let (mut client, _server) = spawn_in_process(CfsctlService::insecure_for_test()).unwrap();
+        let handle = open(&mut client, &path).await;
+
+        // Another call in this process holds a shared lock.
+        let other = open_deferred(&path);
+        let call = other.try_lock_shared().unwrap();
+        assert!(is_busy(&gc(&mut client, handle).await));
+        // Other calls on the handle can share the lock.
+        let fsck = client.fsck(handle, Some(true)).await.unwrap();
+        fsck.expect("fsck while shared lock held");
+        drop(call);
+        gc(&mut client, handle).await.expect("GC after release");
+
+        // A shared lock held by another process.
+        let child = flock_in_child(&path, "--shared");
+        assert!(is_busy(&gc(&mut client, handle).await));
+        release(child);
+        gc(&mut client, handle).await.expect("GC after release");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn calls_busy_while_exclusive_lock_held() {
+        let (_tempdir, path) = create_repo();
+        let (mut client, _server) = spawn_in_process(CfsctlService::insecure_for_test()).unwrap();
+        let handle = open(&mut client, &path).await;
+
+        // E.g. `cfsctl gc` running in another process.
+        let child = flock_in_child(&path, "--exclusive");
+        let fsck = client.fsck(handle, Some(true)).await.unwrap();
+        assert!(is_busy(&fsck), "{fsck:?}");
+        let list = client.list_images(handle, None).await.unwrap();
+        assert!(matches!(list, Err(OciError::Busy { .. })), "{list:?}");
+        release(child);
+
+        let fsck = client.fsck(handle, Some(true)).await.unwrap();
+        fsck.expect("fsck after release");
+        let list = client.list_images(handle, None).await.unwrap();
+        list.expect("list_images after release");
     }
 }

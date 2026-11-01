@@ -1362,21 +1362,23 @@ fn run_init(
 ///
 /// This is the parameterized core shared by [`open_repo`] (which derives the
 /// path and flags from [`App`]) and the varlink service (which holds these
-/// values directly).
+/// values directly). `deferred_lock` selects
+/// [`Repository::open_path_deferred_lock`] over [`Repository::open_path`].
 pub(crate) fn open_repo_at<ObjectID>(
     path: &Path,
     insecure: bool,
     require_verity: bool,
     no_upgrade: bool,
+    deferred_lock: bool,
 ) -> Result<Repository<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
 {
-    let mut repo = if no_upgrade {
-        Repository::open_path(CWD, path)?
-    } else {
-        let (repo, _upgraded) = Repository::open_upgrade(CWD, path)?;
-        repo
+    let mut repo = match (no_upgrade, deferred_lock) {
+        (true, false) => Repository::open_path(CWD, path)?,
+        (true, true) => Repository::open_path_deferred_lock(CWD, path)?,
+        (false, false) => Repository::open_upgrade(CWD, path)?.0,
+        (false, true) => Repository::open_upgrade_deferred_lock(CWD, path)?.0,
     };
     // Hidden --insecure flag for backward compatibility; the default
     // now is to inherit the repo config, but if it's specified we
@@ -1396,7 +1398,13 @@ where
     ObjectID: FsVerityHashValue,
 {
     let path = resolve_repo_path(args)?;
-    let mut repo = open_repo_at(&path, args.insecure, args.require_verity, args.no_upgrade)?;
+    let mut repo = open_repo_at(
+        &path,
+        args.insecure,
+        args.require_verity,
+        args.no_upgrade,
+        false,
+    )?;
     // If the user explicitly passed --erofs-version, override the stored
     // repo setting for this invocation only (does not rewrite meta.json).
     if let Some(version) = args.erofs_version {

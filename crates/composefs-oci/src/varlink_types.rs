@@ -203,6 +203,12 @@ pub enum OciError {
         /// The per-frame cap that was exceeded.
         max_per_frame: u64,
     },
+    /// The repository is locked by a conflicting operation (e.g. GC); retry
+    /// later.
+    Busy {
+        /// Description of the conflict.
+        message: String,
+    },
 }
 
 // ── OciProxy trait ────────────────────────────────────────────────────────────
