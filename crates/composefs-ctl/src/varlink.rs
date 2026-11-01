@@ -1918,28 +1918,11 @@ mod service_impl {
     }
 }
 
-/// A `Listener` that yields a single pre-connected socket, then blocks forever.
+/// A listener that yields a single pre-connected socket, then reports closure.
 ///
-/// Used for socket activation where a connected socket pair is
-/// passed on fd 3. After the first `accept()` returns the connection, subsequent
-/// calls pend indefinitely (the server will be killed by the parent process once
-/// the connection closes).
-#[derive(Debug)]
-pub(crate) struct ActivatedListener {
-    /// The connection to yield on the first accept(), consumed after use.
-    conn: Option<zlink::Connection<zlink::tokio::unix::Stream>>,
-}
-
-impl zlink::Listener for ActivatedListener {
-    type Socket = zlink::tokio::unix::Stream;
-
-    async fn accept(&mut self) -> zlink::Result<Option<zlink::Connection<Self::Socket>>> {
-        match self.conn.take() {
-            Some(conn) => Ok(Some(conn)),
-            None => std::future::pending().await,
-        }
-    }
-}
+/// Used for socket activation where a connected socket pair is passed on fd 3.
+/// The server continues serving that connection and exits when it closes.
+pub(crate) type ActivatedListener = zlink::ReadyListener<zlink::tokio::unix::Stream>;
 
 /// An inherited socket-activation fd, classified by its listening state.
 pub(crate) enum ActivatedSocket {
@@ -2002,10 +1985,9 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
             .context("converting systemd UnixStream to tokio")?;
         let zlink_stream =
             zlink::tokio::unix::Stream::try_from(tokio_stream).map_err(|e| anyhow::anyhow!(e))?;
-        let conn = zlink::Connection::new(zlink_stream);
-        Ok(Some(ActivatedSocket::Connected(ActivatedListener {
-            conn: Some(conn),
-        })))
+        Ok(Some(ActivatedSocket::Connected(ActivatedListener::new(
+            zlink_stream,
+        ))))
     }
 }
 
@@ -2015,7 +1997,8 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
 /// varlinkctl's `exec:` transport) the parent may treat our stdout as part of
 /// the protocol handshake, and any stray bytes there reset the connection.
 ///
-/// The server loop runs inside a [`tokio::task::LocalSet`] so request handlers
+/// Returns when the single connection closes. The server loop runs inside a
+/// [`tokio::task::LocalSet`] so request handlers
 /// can `spawn_local` `!Send` work (see [`pull_stream`]).  Both serve paths
 /// wrap exactly one `LocalSet`.
 pub(crate) async fn serve_activated<S>(service: S, listener: ActivatedListener) -> Result<()>
@@ -2073,6 +2056,52 @@ where
         .with_context(|| format!("binding varlink socket at {}", address.display()))?;
     log::info!("Listening on {}", address.display());
     serve_on_listener(service, listener).await
+}
+
+#[cfg(test)]
+mod activated_tests {
+    use super::{ActivatedListener, CfsctlService, serve_activated};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    #[tokio::test]
+    async fn test_activated_connection_closes() {
+        // Exercise both a served connection and a client that disconnects without
+        // making a call. Neither case needs a repository or activation env vars.
+        for make_call in [true, false] {
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let listener =
+                ActivatedListener::new(zlink::tokio::unix::Stream::try_from(server).unwrap());
+            let client = async move {
+                if make_call {
+                    client
+                        .write_all(b"{\"method\":\"org.varlink.service.GetInfo\"}\0")
+                        .await
+                        .unwrap();
+                    let mut reply = Vec::new();
+                    BufReader::new(&mut client)
+                        .read_until(0, &mut reply)
+                        .await
+                        .unwrap();
+                    assert_eq!(reply.pop(), Some(0));
+                    let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+                    assert_eq!(reply["parameters"]["product"], "cfsctl");
+                }
+                drop(client);
+            };
+            // Bound the entire exchange, including shutdown, so an accept loop
+            // that never notices the disconnect fails instead of hanging.
+            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            tokio::time::timeout(TIMEOUT, async {
+                let (result, ()) = tokio::join!(
+                    serve_activated(CfsctlService::activated(), listener),
+                    client
+                );
+                result.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("activated server did not exit (make_call={make_call})"));
+        }
+    }
 }
 
 /// Varlink support for the OCI interface (`org.composefs.Oci`).
