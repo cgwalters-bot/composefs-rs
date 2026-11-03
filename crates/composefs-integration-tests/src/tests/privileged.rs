@@ -1152,12 +1152,19 @@ impl Drop for MountGuard {
     }
 }
 
+// Both external files span many pages whose contents differ, so a read of the
+// wrong page or offset cannot return the expected bytes.
 fn bigfile_content() -> Vec<u8> {
-    vec![b'A'; 600]
+    // 251 is prime, so no 4 KiB page repeats its predecessor.
+    (0u8..251).cycle().take(128 * 1024).collect()
 }
 
 fn biglib_content() -> Vec<u8> {
-    (0u8..=255).cycle().take(800).collect()
+    // Each 4-byte word holds its own index, with a partial final page.
+    (0u32..)
+        .flat_map(u32::to_le_bytes)
+        .take(256 * 1024 + 17)
+        .collect()
 }
 
 fn build_test_filesystem(
@@ -1178,7 +1185,19 @@ fn build_test_filesystem(
             st_gid: gid,
             st_mtim_sec: mtime,
             st_mtim_nsec: 0,
-            xattrs: BTreeMap::new(),
+            // Exercise listxattr/getxattr on directories and every leaf type,
+            // including empty and binary values (not just printable strings).
+            // Unlike user.*, security.* is readable on special files too.
+            xattrs: BTreeMap::from([
+                (
+                    OsStr::new("security.test-empty").into(),
+                    Box::from(&b""[..]),
+                ),
+                (
+                    OsStr::new("security.test-binary").into(),
+                    Box::from(&b"\0\xff=value\n"[..]),
+                ),
+            ]),
         }
     }
 
@@ -1195,9 +1214,9 @@ fn build_test_filesystem(
         );
         fs.leaves.push(Leaf {
             stat: Stat {
-                st_mode: 0o755,
-                st_uid: 0,
-                st_gid: 0,
+                st_mode: 0o4751,
+                st_uid: 1234,
+                st_gid: 2345,
                 st_mtim_sec: 1_700_000_001,
                 st_mtim_nsec: 0,
                 xattrs,
@@ -1286,8 +1305,46 @@ fn build_test_filesystem(
     let mut dev = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_014));
     dev.insert(OsStr::new("null"), Inode::leaf(devnull_id));
 
+    let block_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o640, 1234, 2345, 1_700_000_016),
+        content: LeafContent::BlockDevice(rustix::fs::makedev(8, 1)),
+    });
+    dev.insert(OsStr::new("disk"), Inode::leaf(block_id));
+
     let mut tmp_dir = Directory::<Sha256HashValue>::new(mkstat(0o1777, 0, 0, 1_700_000_015));
     tmp_dir.insert(OsStr::new("fifo"), Inode::leaf(fifo_id));
+    for (name, content) in [
+        ("socket", LeafContent::Socket),
+        (
+            "empty",
+            LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+        ),
+        (
+            "inline-binary",
+            LeafContent::Regular(RegularFile::Inline(Box::from(&b"\0\xff\ninline"[..]))),
+        ),
+        (
+            "dangling-link",
+            LeafContent::Symlink(OsStr::new("missing-target").into()),
+        ),
+    ] {
+        let id = LeafId(fs.leaves.len());
+        fs.leaves.push(Leaf {
+            stat: mkstat(0o751, 1234, 2345, 1_700_000_017),
+            content,
+        });
+        tmp_dir.insert(OsStr::new(name), Inode::leaf(id));
+    }
+    tmp_dir.insert(
+        OsStr::new("empty-dir"),
+        Inode::Directory(Box::new(Directory::new(mkstat(
+            0o2750,
+            1234,
+            2345,
+            1_700_000_018,
+        )))),
+    );
 
     fs.root
         .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr)));
@@ -1307,6 +1364,7 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
 
     use composefs_oci::composefs::{
         dumpfile::write_dumpfile,
+        dumpfile_parse::{Entry, Item},
         erofs::{
             reader::erofs_to_filesystem,
             writer::{ValidatedFileSystem, mkfs_erofs},
@@ -1386,29 +1444,62 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
-        .context("reading bigfile from FUSE mount")?;
-    ensure!(
-        bigfile_actual == bigfile_content(),
-        "bigfile content mismatch: got {} bytes, expected {}",
-        bigfile_actual.len(),
-        bigfile_content().len(),
-    );
-    let biglib_actual = std::fs::read(mountpoint.join("usr/lib/biglib.so"))
-        .context("reading biglib.so from FUSE mount")?;
-    ensure!(
-        biglib_actual == biglib_content(),
-        "biglib.so content mismatch: got {} bytes, expected {}",
-        biglib_actual.len(),
-        biglib_content().len(),
-    );
-
     let sh = Shell::new()?;
+    // A missing FUSE reply must fail the test rather than hang its client.
+    let timeout = ["--kill-after=5s", "30s"];
+
+    // The scanner below reconstructs link counts from the tree it walks, so
+    // separately check the link counts and other attributes that stat(1)
+    // gets back from the mount, and that hardlinks share one inode.
+    for line in expected_dump.lines() {
+        let entry = Entry::parse(line)?;
+        let path = mountpoint.join(entry.path.strip_prefix("/")?);
+        let nlink = match entry.item {
+            Item::Hardlink { target } => {
+                let target = mountpoint.join(target.strip_prefix("/")?);
+                let actual =
+                    cmd!(sh, "timeout {timeout...} stat --format=%d:%i -- {path}").read()?;
+                let expected =
+                    cmd!(sh, "timeout {timeout...} stat --format=%d:%i -- {target}").read()?;
+                ensure!(
+                    actual == expected,
+                    "hardlink {path:?} is inode {actual}, but its target {target:?} is {expected}",
+                );
+                continue;
+            }
+            Item::RegularInline { nlink, .. }
+            | Item::Regular { nlink, .. }
+            | Item::Device { nlink, .. }
+            | Item::Symlink { nlink, .. }
+            | Item::Fifo { nlink }
+            | Item::Socket { nlink }
+            | Item::Directory { nlink } => nlink,
+        };
+        let actual = cmd!(
+            sh,
+            "timeout {timeout...} stat --format=%f:%h:%u:%g:%Y -- {path}"
+        )
+        .read()?;
+        let expected = format!(
+            "{:x}:{nlink}:{}:{}:{}",
+            entry.mode, entry.uid, entry.gid, entry.mtime.sec,
+        );
+        ensure!(
+            actual == expected,
+            "stat mismatch for {path:?}: expected mode:nlink:uid:gid:mtime {expected}, got {actual}",
+        );
+    }
+
+    // The external scanner uses readdir, openat (lookup), fstat (getattr),
+    // readlinkat, listxattr/getxattr, and reads every regular file. Comparing
+    // its dump checks inline bytes and external files' computed verity digests,
+    // as well as metadata, device numbers, symlink targets and hardlink identity.
+    // It never opens devices, FIFOs or sockets for I/O.
     let mp = mountpoint.to_str().context("non-UTF-8 mountpoint")?;
     let repo_arg = repo_path.to_str().context("non-UTF-8 repo path")?;
     let actual_dump = cmd!(
         sh,
-        "{cfsctl_bin} --repo {repo_arg} create-dumpfile --no-propagate-usr-to-root {mp}"
+        "timeout {timeout...} {cfsctl_bin} --repo {repo_arg} create-dumpfile --no-propagate-usr-to-root {mp}"
     )
     .read()?;
 
