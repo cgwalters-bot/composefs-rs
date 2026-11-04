@@ -36,6 +36,10 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# Real apt acquisition fault injection (Linux with apt-get, dpkg-deb, Python 3)
+test-apt-acquire:
+    python3 ci/test-apt-acquire.py
+
 # Check that fuzz targets compile
 check-fuzz:
     cargo check --manifest-path crates/composefs/fuzz/Cargo.toml
