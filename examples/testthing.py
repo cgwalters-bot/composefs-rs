@@ -44,7 +44,10 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import sys
+import threading
+import time
 import traceback
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
@@ -53,6 +56,105 @@ from types import TracebackType
 from typing import Never, Self
 
 logger = logging.getLogger(__name__)
+
+# Keep failure evidence small even if a guest floods its console. Only the local
+# regular console file is inspected: diagnostics never contact a failed guest.
+_REBOOT_CONSOLE_BYTES = 16 * 1024
+_REBOOT_DIAGNOSTIC_SECONDS = 0.25
+
+
+def _console_tail(ipc: Path) -> bytes:
+    fd = os.open(ipc / "console", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("console is not a regular file")
+        offset = max(0, info.st_size - _REBOOT_CONSOLE_BYTES)
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks = []
+        remaining = min(info.st_size, _REBOOT_CONSOLE_BYTES)
+        while remaining:
+            chunk = os.read(fd, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        # A partial first line could contain a suffix of a credential or key.
+        return data.partition(b"\n")[2] if offset else data
+    finally:
+        os.close(fd)
+
+
+def _sanitize_console(data: bytes, secrets: Iterable[str]) -> str:
+    text = data.decode("utf-8", errors="replace")
+    text = re.sub(r"\033\[[0-?]*[ -/]*[@-~]", "", text)
+    secret_lines = [line for secret in secrets for line in secret.splitlines() if line]
+    lines = []
+    # If the tail starts inside a key, redact everything up to its end marker.
+    in_key = "PRIVATE KEY" in text.partition("BEGIN ")[0]
+    for line in text.splitlines():
+        # Drop controls (including terminal escape/OSC injection) before logging.
+        line = "".join(c for c in line if c.isprintable() or c == "\t")
+        key_end = "END " in line and "PRIVATE KEY" in line
+        in_key = in_key or ("BEGIN " in line and "PRIVATE KEY" in line)
+        # A boundary-less/prefixed body may be all the tail contains. Suppress
+        # the remaining block too, including a short final base64 fragment.
+        in_key = in_key or bool(re.search(r"\b[A-Za-z0-9+/=]{32,}", line))
+        if (
+            in_key
+            or any(secret in line for secret in secret_lines)
+            or re.search(
+                r"private key|public key|ssh-\w+|password|secret|token|credential|"
+                r"authorization|authorized_keys|://[^/\s]*@",
+                line,
+                re.IGNORECASE,
+            )
+            # Also covers key bodies when the tail starts inside a PEM block.
+            # Be conservative even for the short final line of a key body.
+            or re.fullmatch(r"[A-Za-z0-9+/=]+", line.strip())
+        ):
+            line = "[redacted]"
+        lines.append(line)
+        if key_end:
+            in_key = False
+    return (
+        "\n".join(lines)
+        .encode()[:_REBOOT_CONSOLE_BYTES]
+        .decode("utf-8", errors="ignore")
+    )
+
+
+async def _bounded_diagnostic(action: Callable[[], None]) -> None:
+    """Bound local I/O and log handlers without blocking the event loop.
+
+    A daemon thread, not the default executor, means even a stalled filesystem
+    or log handler cannot hold up asyncio shutdown. Late results are discarded.
+    No worker is joined, and no worker can issue commands to the guest.
+    """
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def finish() -> None:
+        if not done.done():
+            done.set_result(None)
+
+    def worker() -> None:
+        try:
+            action()
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001, S110
+            pass  # Diagnostics must not replace the primary error.
+        finally:
+            try:
+                loop.call_soon_threadsafe(finish)
+            except RuntimeError:
+                pass  # The event loop has already closed.
+
+    try:
+        threading.Thread(target=worker, daemon=True).start()
+        await asyncio.wait_for(done, _REBOOT_DIAGNOSTIC_SECONDS)
+    except Exception:  # noqa: BLE001, S110
+        pass  # A diagnostic failure/timeout is not a guest/test result.
 
 
 # This is basically tempfile.TemporaryDirectory but sequentially-allocated.
@@ -405,6 +507,7 @@ class VirtualMachine:
         cpus: int = 4,
         identity: tuple[Path, str | None] | None = None,
         memory: int | str = "4G",
+        reboot_diagnostics: bool = False,
         sit: bool = False,
         snapshot: bool = True,
         status_messages: bool = False,
@@ -421,6 +524,8 @@ class VirtualMachine:
             If the public key is specified as None then it won't be configured on
             the guest.  The default (None) is to generate an ephemeral keypair.
           - memory: how much memory the guest gets in MiB, or a string like "4G"
+          - reboot_diagnostics: log reboot phases and a sanitized local console
+            tail on failure, via normal logging (off by default)
           - sit: if we should "sit" when an exception occurs: print the exception
             and wait for input (to allow inspecting the running VM)
           - snapshot: if the 'snapshot' option is used on the disk (changes are
@@ -436,6 +541,9 @@ class VirtualMachine:
         self._credentials = credentials
         self._identity = identity
         self._memory = memory
+        self._reboot_diagnostics = reboot_diagnostics
+        self._reboot_started: float | None = None
+        self._reboot_messages: list[tuple[str, tuple[object, ...]]] = []
         self._sit = sit
         self._snapshot = snapshot
         self._status_messages = status_messages
@@ -994,12 +1102,98 @@ class VirtualMachine:
         try:
             yield
         finally:
-            await self._ssh_control_ready.wait()
+            async with self._reboot_phase("reconnect"):
+                await self._ssh_control_ready.wait()
+
+    def _reboot_log(self, message: str, *args: object) -> None:
+        # At most two records per phase. Buffering avoids adding cancellation
+        # checkpoints between the direct command and the reconnect wait.
+        self._reboot_messages.append((message, args))
+
+    async def _flush_reboot_diagnostics(self, *, console: bool = False) -> None:
+        messages, self._reboot_messages = self._reboot_messages, []
+        deadline = time.monotonic() + _REBOOT_DIAGNOSTIC_SECONDS
+
+        def emit() -> None:
+            for message, args in messages:
+                logger.warning(message, *args)
+            if console:
+                self._reboot_console(deadline)
+
+        await _bounded_diagnostic(emit)
+
+    @contextlib.asynccontextmanager
+    async def _reboot_phase(self, phase: str) -> AsyncGenerator[None]:
+        if self._reboot_started is None:
+            yield
+            return
+        started = time.monotonic()
+        try:
+            self._reboot_log(
+                "reboot phase=%s start elapsed=%.3fs",
+                phase,
+                started - self._reboot_started,
+            )
+            yield
+        except BaseException as exc:
+            # Never format the exception: subprocess arguments may carry secrets.
+            try:
+                self._reboot_log(
+                    "reboot phase=%s failed elapsed=%.3fs error=%s returncode=%s",
+                    phase,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                    exc.returncode if isinstance(exc, SubprocessError) else None,
+                )
+                await self._flush_reboot_diagnostics(console=True)
+            except asyncio.CancelledError:
+                pass  # Preserve the exception/cancellation already being handled.
+            raise
+        else:
+            self._reboot_log(
+                "reboot phase=%s complete elapsed=%.3fs",
+                phase,
+                time.monotonic() - started,
+            )
+
+    def _reboot_console(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            return  # A stalled log handler may have outlived the IPC directory.
+        try:
+            secrets = list(self._credentials.values())
+            if self._identity and self._identity[1]:
+                secrets.append(self._identity[1])
+            tail = _sanitize_console(_console_tail(self._ipc), secrets)
+            if time.monotonic() >= deadline:
+                return  # Do not publish late evidence after IPC cleanup.
+            logger.warning(
+                "reboot console tail (at most %d bytes):\n%s",
+                _REBOOT_CONSOLE_BYTES,
+                tail,
+            )
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            if time.monotonic() < deadline:
+                logger.warning(
+                    "reboot console unavailable error=%s", type(exc).__name__
+                )
 
     async def reboot(self) -> None:
         """Reboot the guest, waiting until it's back online."""
-        async with self.disconnected():
-            await self.execute("reboot", direct=True)
+        if self._reboot_diagnostics:
+            self._reboot_started = time.monotonic()
+        try:
+            async with self.disconnected(), self._reboot_phase("direct-ssh"):
+                await self.execute("reboot", direct=True)
+        finally:
+            primary = sys.exception()
+            try:
+                if self._reboot_messages:
+                    await self._flush_reboot_diagnostics()
+            except asyncio.CancelledError:
+                if primary is None:
+                    raise
+            finally:
+                self._reboot_started = None
 
     async def qmp(self, command: str) -> object:
         """Send a QMP command to the hypervisor.
