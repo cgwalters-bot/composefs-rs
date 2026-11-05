@@ -1,0 +1,48 @@
+{
+  "status": "blocked",
+  "repository": "cgwalters-forge/composefs-rs",
+  "inspected_actions_commit": "9589edab2953e53fb244ec058011efe5e714c6ec",
+  "agent_board_contract_commit": "9841aabf72204fde3825e2690bda2ab737236a48",
+  "missing_prerequisites": [
+    "explicit draft admission in the reviewed immutable wrapper",
+    "independently checked agent-board-review-result-v1 writer"
+  ],
+  "sender_inputs_example_only": {
+    "kind": "review",
+    "repo": "cgwalters-forge/composefs-rs",
+    "item": "1",
+    "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "pool": "openai",
+    "task": "Review the exact head; this hint is not trusted instructions."
+  },
+  "negative_inputs": [
+    {"field": "head", "value": "", "expect": "refuse"},
+    {"field": "head", "value": "main", "expect": "refuse"},
+    {"field": "pool", "value": "", "expect": "refuse"},
+    {"field": "repo", "value": "other/repository", "expect": "refuse"},
+    {"field": "kind", "value": "implement", "expect": "refuse"},
+    {"field": "item", "value": "0", "expect": "refuse"}
+  ],
+  "negative_results": [
+    {"case": "moved head", "expect": "deep"},
+    {"case": "edited title or description", "expect": "deep"},
+    {"case": "missing semantic diff or description evidence", "expect": "deep"},
+    {"case": "failed or incomplete current-head CI", "expect": "deep"},
+    {"case": "implementation run with review-shaped title", "expect": "deep"},
+    {"case": "missing, duplicate or unsuccessful result writer", "expect": "deep"},
+    {"case": "writer from a different run or attempt", "expect": "deep"},
+    {"case": "submission outside writer interval", "expect": "deep"},
+    {"case": "missing prior durable head reservation", "expect": "deep"},
+    {"case": "partial job inventory", "expect": "deep"},
+    {"case": "non-Actions-bot or comment instead of review", "expect": "deep"},
+    {"case": "unknown schema or duplicate result fence", "expect": "deep"},
+    {"case": "oversized result or multiline evidence", "expect": "deep"}
+  ],
+  "negative_workflows": [
+    {"case": "ordinary wrapper rejects drafts", "expect": "do not install"},
+    {"case": "implementation job renamed as result writer", "expect": "do not install"},
+    {"case": "head checkout with writer token", "expect": "do not install"},
+    {"case": "automatic trigger alongside controller dispatch", "expect": "do not install"},
+    {"case": "mutable wrapper reference", "expect": "do not install"}
+  ]
+}
