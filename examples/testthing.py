@@ -44,15 +44,88 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import sys
+import time
 import traceback
 import weakref
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Never, Self
 
 logger = logging.getLogger(__name__)
+
+# Keep failure evidence small even if a guest floods its console. Only the local
+# regular console file is inspected: diagnostics never contact a failed guest.
+_REBOOT_CONSOLE_BYTES = 16 * 1024
+
+
+def _console_tail(ipc: Path) -> bytes:
+    fd = os.open(ipc / "console", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("console is not a regular file")
+        offset = max(0, info.st_size - _REBOOT_CONSOLE_BYTES)
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks = []
+        remaining = min(info.st_size, _REBOOT_CONSOLE_BYTES)
+        while remaining:
+            chunk = os.read(fd, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        # A partial first line could contain a suffix of a credential or key.
+        return data.partition(b"\n")[2] if offset else data
+    finally:
+        os.close(fd)
+
+
+_PEM_PRIVATE_KEY = re.compile(r"-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+def _sanitize_console(data: bytes, secrets: Iterable[str]) -> str:
+    """Remove the secrets testthing itself knows about from console output.
+
+    Only configured credential values, the public identity and PEM private key
+    blocks are redacted; ordinary boot logs (hashes included) are kept, as the
+    startup-timeout path in VirtualMachine.__aenter__ already logs the console
+    in full.
+    """
+    text = data.decode("utf-8", errors="replace")
+    text = re.sub(r"\033\[[0-?]*[ -/]*[@-~]", "", text)
+    secret_lines = [line for secret in secrets for line in secret.splitlines() if line]
+    # Drop controls (including terminal escape/OSC injection) before logging.
+    lines = [
+        "".join(c for c in line if c.isprintable() or c == "\t")
+        for line in text.splitlines()
+    ]
+    markers = [m[1] for line in lines if (m := _PEM_PRIVATE_KEY.search(line))]
+    # If the tail starts inside a key, redact everything up to its end marker.
+    in_key = bool(markers) and markers[0] == "END"
+    for i, line in enumerate(lines):
+        marker = _PEM_PRIVATE_KEY.search(line)
+        in_key = in_key or (marker is not None and marker[1] == "BEGIN")
+        if in_key or any(secret in line for secret in secret_lines):
+            lines[i] = "[redacted]"
+        if marker is not None and marker[1] == "END":
+            in_key = False
+    # Replacement characters can triple invalid input; keep the newest lines.
+    return (
+        "\n".join(lines)
+        .encode()[-_REBOOT_CONSOLE_BYTES:]
+        .decode("utf-8", errors="ignore")
+    )
+
+
+def _reboot_log(message: str, *args: object) -> None:
+    try:
+        logger.warning(message, *args)
+    except Exception:  # noqa: BLE001, S110
+        pass  # Diagnostics must not replace the primary error.
 
 
 # This is basically tempfile.TemporaryDirectory but sequentially-allocated.
@@ -405,6 +478,7 @@ class VirtualMachine:
         cpus: int = 4,
         identity: tuple[Path, str | None] | None = None,
         memory: int | str = "4G",
+        reboot_diagnostics: bool = False,
         sit: bool = False,
         snapshot: bool = True,
         status_messages: bool = False,
@@ -421,6 +495,8 @@ class VirtualMachine:
             If the public key is specified as None then it won't be configured on
             the guest.  The default (None) is to generate an ephemeral keypair.
           - memory: how much memory the guest gets in MiB, or a string like "4G"
+          - reboot_diagnostics: log reboot phases and a sanitized local console
+            tail on failure, via normal logging (off by default)
           - sit: if we should "sit" when an exception occurs: print the exception
             and wait for input (to allow inspecting the running VM)
           - snapshot: if the 'snapshot' option is used on the disk (changes are
@@ -436,6 +512,8 @@ class VirtualMachine:
         self._credentials = credentials
         self._identity = identity
         self._memory = memory
+        self._reboot_diagnostics = reboot_diagnostics
+        self._reboot_started: float | None = None
         self._sit = sit
         self._snapshot = snapshot
         self._status_messages = status_messages
@@ -994,12 +1072,60 @@ class VirtualMachine:
         try:
             yield
         finally:
-            await self._ssh_control_ready.wait()
+            with self._reboot_phase("reconnect"):
+                await self._ssh_control_ready.wait()
+
+    @contextlib.contextmanager
+    def _reboot_phase(self, phase: str) -> Iterator[None]:
+        # Synchronous logging only: no extra cancellation checkpoints or worker
+        # threads, and the console is read before the IPC directory is removed.
+        if self._reboot_started is None:
+            yield
+            return
+        started = time.monotonic()
+        _reboot_log(
+            "reboot phase=%s start elapsed=%.3fs", phase, started - self._reboot_started
+        )
+        try:
+            yield
+        except BaseException as exc:
+            # Never format the exception: subprocess arguments may carry secrets.
+            _reboot_log(
+                "reboot phase=%s failed elapsed=%.3fs error=%s returncode=%s",
+                phase,
+                time.monotonic() - started,
+                type(exc).__name__,
+                exc.returncode if isinstance(exc, SubprocessError) else None,
+            )
+            self._reboot_console()
+            raise
+        _reboot_log(
+            "reboot phase=%s complete elapsed=%.3fs", phase, time.monotonic() - started
+        )
+
+    def _reboot_console(self) -> None:
+        secrets = list(self._credentials.values())
+        if self._identity and self._identity[1]:
+            secrets.append(self._identity[1])
+        try:
+            tail = _sanitize_console(_console_tail(self._ipc), secrets)
+        except Exception as exc:  # noqa: BLE001
+            _reboot_log("reboot console unavailable error=%s", type(exc).__name__)
+            return
+        _reboot_log(
+            "reboot console tail (at most %d bytes):\n%s", _REBOOT_CONSOLE_BYTES, tail
+        )
 
     async def reboot(self) -> None:
         """Reboot the guest, waiting until it's back online."""
-        async with self.disconnected():
-            await self.execute("reboot", direct=True)
+        if self._reboot_diagnostics:
+            self._reboot_started = time.monotonic()
+        try:
+            async with self.disconnected():
+                with self._reboot_phase("direct-ssh"):
+                    await self.execute("reboot", direct=True)
+        finally:
+            self._reboot_started = None
 
     async def qmp(self, command: str) -> object:
         """Send a QMP command to the hypervisor.
