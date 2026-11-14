@@ -1688,18 +1688,18 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
 
 /// Result of scanning a directory's entries, separating '.' and '..' from
 /// the normal children.
-struct DirEntries<'a> {
+pub(crate) struct DirEntries<'a> {
     /// The nid that '.' points to, if present.
     dot_nid: Option<u64>,
     /// The nid that '..' points to, if present.
     dotdot_nid: Option<u64>,
     /// Child entries (everything except '.' and '..').
-    children: Vec<(&'a [u8], u64)>,
+    pub(crate) children: Vec<(&'a [u8], u64)>,
 }
 
 /// Collect directory entries from an inode, separating '.' and '..' from
 /// the normal children.
-fn dir_entries<'a>(
+pub(crate) fn dir_entries<'a>(
     img: &'a Image<'a>,
     dir_inode: &'a InodeType<'a>,
 ) -> anyhow::Result<DirEntries<'a>> {

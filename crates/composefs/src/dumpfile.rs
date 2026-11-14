@@ -21,6 +21,7 @@ use rustix::fs::FileType;
 
 use crate::{
     dumpfile_parse::{Entry, Item},
+    erofs::reader::{Image, InodeHeader, dir_entries, erofs_to_filesystem},
     fsverity::FsVerityHashValue,
     generic_tree::LeafId,
     tree::{Directory, FileSystem, Inode, LeafContent, RegularFile, Stat},
@@ -153,12 +154,22 @@ pub fn write_directory(
     stat: &Stat,
     nlink: usize,
 ) -> fmt::Result {
+    write_directory_with_size(writer, path, stat, nlink, 0)
+}
+
+fn write_directory_with_size(
+    writer: &mut impl fmt::Write,
+    path: &Path,
+    stat: &Stat,
+    nlink: usize,
+    size: u64,
+) -> fmt::Result {
     write_entry(
         writer,
         path,
         stat,
         FileType::Directory,
-        0,
+        size,
         nlink,
         0,
         "",
@@ -320,7 +331,26 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
     }
 
     #[context("Writing directory to dumpfile: {}", path.display())]
-    fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory<ObjectID>) -> Result<()> {
+    fn write_dir(
+        &mut self,
+        path: &mut PathBuf,
+        dir: &Directory<ObjectID>,
+        source: Option<(&Image<'_>, u64)>,
+    ) -> Result<()> {
+        // C composefs-info prints the loaded inode's i_size, not the size of
+        // the logical tree. In particular, root whiteout stubs are omitted
+        // from that tree and a promoted directory tail includes block padding.
+        let (size, children) = if let Some((image, nid)) = source {
+            let inode = image.inode(nid)?;
+            let children = dir_entries(image, &inode)?
+                .children
+                .into_iter()
+                .map(|(name, nid)| (OsString::from(OsStr::from_bytes(name)), nid))
+                .collect::<BTreeMap<_, _>>();
+            (inode.size(), children)
+        } else {
+            (0, BTreeMap::new())
+        };
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
         let nlink = dir.inodes().fold(2, |count, inode| {
@@ -333,7 +363,7 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
         });
 
         writeln_fmt(self.writer, |fmt| {
-            write_directory(fmt, path, &dir.stat, nlink)
+            write_directory_with_size(fmt, path, &dir.stat, nlink, size)
         })?;
 
         for (name, inode) in dir.sorted_entries() {
@@ -341,7 +371,16 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
 
             match inode {
                 Inode::Directory(dir) => {
-                    self.write_dir(path, dir)?;
+                    let child_source = source
+                        .map(|(image, _)| {
+                            children
+                                .get(name)
+                                .copied()
+                                .map(|nid| (image, nid))
+                                .context("Directory missing from source image")
+                        })
+                        .transpose()?;
+                    self.write_dir(path, dir, child_source)?;
                 }
                 Inode::Leaf(leaf_id, _) => {
                     self.write_leaf(path, *leaf_id)?;
@@ -387,6 +426,30 @@ pub fn write_dumpfile(
     dump_single_dir(writer, &fs.root, fs, &nlink_map, path)
 }
 
+/// Dump an EROFS image, retaining serialized directory sizes.
+///
+/// Unlike [`write_dumpfile`], which dumps an unserialized logical tree with
+/// zero directory sizes, this prints the actual inode `i_size`, matching
+/// composefs-c's `lcfs_load_node_from_image` and `composefs-info dump` (commit
+/// ec2573a0f68f548ae91f3e10acc990a08f9122dc). No image metadata is rewritten.
+pub fn write_erofs_dumpfile<ObjectID: FsVerityHashValue>(
+    writer: &mut impl Write,
+    data: &[u8],
+) -> Result<()> {
+    let fs = erofs_to_filesystem::<ObjectID>(data)?;
+    let image = Image::open(data)?;
+    let nlink_map = fs.nlinks();
+    let mut buffer = BufWriter::new(writer);
+    let mut dfw = DumpfileWriter::new(&mut buffer, &fs, &nlink_map);
+    dfw.write_dir(
+        &mut PathBuf::from("/"),
+        &fs.root,
+        Some((&image, image.sb.root_nid.get().into())),
+    )?;
+    buffer.flush()?;
+    Ok(())
+}
+
 /// Write a single dir
 pub fn dump_single_dir<ObjectID: FsVerityHashValue>(
     writer: &mut impl Write,
@@ -400,7 +463,7 @@ pub fn dump_single_dir<ObjectID: FsVerityHashValue>(
     let mut buffer = BufWriter::with_capacity(32768, writer);
     let mut dfw = DumpfileWriter::new(&mut buffer, fs, nlink_map);
 
-    dfw.write_dir(&mut path, dir)?;
+    dfw.write_dir(&mut path, dir, None)?;
     buffer.flush()?;
 
     Ok(())
@@ -660,6 +723,67 @@ mod tests {
 /small_file 5 100644 1 0 0 0 1000.0 - hello -
 /symlink 7 120777 1 0 0 0 1000.0 /target - -
 "#;
+
+    #[test]
+    fn test_image_directory_sizes() -> Result<()> {
+        use crate::erofs::{
+            format::FormatVersion,
+            writer::{ValidatedFileSystem, mkfs_erofs_versioned},
+        };
+        use std::fmt::Write as _;
+
+        // Each fNNNN entry occupies 12 header bytes + 5 name bytes. Dot
+        // entries occupy 27 bytes. Tails larger than half a block are
+        // promoted, and entries never straddle a block boundary.
+        for (count, expected_size) in [(0, 27), (118, 2033), (119, 4096), (240, 4113), (500, 8549)]
+        {
+            for version in [FormatVersion::V0, FormatVersion::V1, FormatVersion::V2] {
+                let mut input = String::from(
+                    "/ 0 40755 4 0 0 0 1000.0 - - -\n\
+                     /empty 0 40755 2 0 0 0 1000.0 - - -\n\
+                     /many 0 40755 2 0 0 0 1000.0 - - -\n",
+                );
+                for i in 0..count {
+                    writeln!(input, "/many/f{i:04} 0 100644 1 0 0 0 1000.0 - - -")?;
+                }
+                let fs = dumpfile_to_filesystem::<Sha256HashValue>(&input)?;
+                let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, version);
+                let mut output = Vec::new();
+                write_erofs_dumpfile::<Sha256HashValue>(&mut output, &image)?;
+                let output = String::from_utf8(output)?;
+                let sizes: BTreeMap<_, _> = output
+                    .lines()
+                    .map(|line| {
+                        let mut fields = line.split_whitespace();
+                        (
+                            fields.next().unwrap(),
+                            fields.next().unwrap().parse::<u64>().unwrap(),
+                        )
+                    })
+                    .collect();
+                // V0/V1's root includes 256 hidden whiteout stubs. The
+                // logical tree cannot recover its serialized size.
+                let root_size = if version == FormatVersion::V2 {
+                    60
+                } else {
+                    4096
+                };
+                assert_eq!(sizes["/"], root_size, "{version:?}, {count}");
+                assert_eq!(sizes["/empty"], 27, "{version:?}, {count}");
+                assert_eq!(sizes["/many"], expected_size, "{version:?}, {count}");
+
+                // Directory dump sizes are descriptive, not writer inputs:
+                // parsing the dump must reproduce the exact image bytes.
+                let fs = dumpfile_to_filesystem::<Sha256HashValue>(&output)?;
+                assert_eq!(
+                    mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, version),
+                    image,
+                    "{version:?}, {count}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_simple_dumpfile_conversion() -> Result<()> {

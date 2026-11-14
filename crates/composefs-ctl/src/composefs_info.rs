@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use composefs::{
-    dumpfile::write_dumpfile,
+    dumpfile::write_erofs_dumpfile,
     erofs::reader::erofs_to_filesystem,
     fsverity::{FsVerityHashValue, Sha256HashValue, measure_verity_with_fallback},
     generic_tree::{Inode, LeafContent, LeafId},
@@ -230,9 +230,7 @@ fn cmd_dump(_filter: &[String], images: &[PathBuf]) -> Result<()> {
 
     for image_path in images {
         let image_data = read_image(image_path)?;
-        let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
-            .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
-        write_dumpfile(&mut out, &fs)
+        write_erofs_dumpfile::<Sha256HashValue>(&mut out, &image_data)
             .with_context(|| format!("Failed to dump image: {image_path:?}"))?;
     }
 
