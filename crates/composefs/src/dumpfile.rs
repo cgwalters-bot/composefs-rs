@@ -682,6 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_corpus_entries_rejected() {
+        for (line, error) in [
+            (
+                "/ 4096 40755 2 0 0 0 0.0 - - - =somevalue",
+                "xattr name cannot be empty",
+            ),
+            (
+                "/bigfile 9500000000000000 100777 1 0 0 0 0.0 - - -",
+                "Non-inline file size",
+            ),
+        ] {
+            let dumpfile = if line.starts_with("/bigfile") {
+                format!("/ 4096 40755 2 0 0 0 0.0 - - -\n{line}\n")
+            } else {
+                line.to_owned()
+            };
+            let result = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile);
+            assert!(format!("{:#}", result.unwrap_err()).contains(error));
+        }
+    }
+
+    #[test]
     fn test_hardlinks() -> Result<()> {
         // The nlink/uid/gid/rdev fields on hardlink lines use `-` here,
         // matching the C composefs writer convention.  The parser must
