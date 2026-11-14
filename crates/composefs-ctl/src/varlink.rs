@@ -596,11 +596,17 @@ fn run_mount<ObjectID: FsVerityHashValue>(
 ) -> std::result::Result<(MountReply, Vec<std::os::fd::OwnedFd>), RepositoryError> {
     let options = params.to_mount_options(fds)?;
 
-    let mount_fd =
-        repo.mount_with_options(name, &options)
-            .map_err(|e| RepositoryError::InternalError {
+    let mount_fd = repo.mount_with_options(name, &options).map_err(|e| {
+        if let Some(nf) = e.downcast_ref::<composefs::ImageNotFound>() {
+            RepositoryError::NoSuchRef {
+                reference: nf.name.clone(),
+            }
+        } else {
+            RepositoryError::InternalError {
                 message: format!("{e:#}"),
-            })?;
+            }
+        }
+    })?;
 
     Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
 }
@@ -615,20 +621,18 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
 ) -> std::result::Result<(MountReply, Vec<std::os::fd::OwnedFd>), oci::OciError> {
     let img = if image.starts_with("sha256:") {
         let digest: composefs_oci::OciDigest =
-            image.parse().map_err(|e| oci::OciError::InternalError {
+            image.parse().map_err(|e| oci::OciError::InvalidDigest {
                 message: format!("Invalid manifest digest: {e}"),
             })?;
         composefs_oci::OciImage::open(repo, &digest, None)
     } else {
         composefs_oci::OciImage::open_ref(repo, image)
     }
-    .map_err(|e| oci::OciError::NoSuchImage {
-        image: format!("{image}: {e:#}"),
-    })?;
+    .map_err(oci_image_error)?;
 
     let options = params
         .to_mount_options(fds)
-        .map_err(|e| oci::OciError::InternalError {
+        .map_err(|e| oci::OciError::InvalidRequest {
             message: format!("{e:?}"),
         })?;
 
@@ -788,6 +792,24 @@ async fn run_oci_fsck<ObjectID: FsVerityHashValue>(
     Ok(oci::OciFsckReply::from(&result))
 }
 
+/// Preserve documented absence errors without treating corruption as absence.
+#[cfg(feature = "oci")]
+fn oci_image_error(e: anyhow::Error) -> oci::OciError {
+    if let Some(nf) = e.downcast_ref::<composefs_oci::OciRefNotFound>() {
+        oci::OciError::NoSuchImage {
+            image: nf.name.clone(),
+        }
+    } else if let Some(nf) = e.downcast_ref::<composefs_oci::OciImageNotFound>() {
+        oci::OciError::NoSuchImage {
+            image: nf.digest.clone(),
+        }
+    } else {
+        oci::OciError::InternalError {
+            message: format!("{e:#}"),
+        }
+    }
+}
+
 /// Inspect a single OCI image.
 #[cfg(feature = "oci")]
 async fn run_inspect<ObjectID: FsVerityHashValue>(
@@ -795,24 +817,10 @@ async fn run_inspect<ObjectID: FsVerityHashValue>(
     image: String,
 ) -> std::result::Result<oci::OciInspectReply, oci::OciError> {
     let reference: crate::OciReference =
-        image.parse().map_err(|e| oci::OciError::InternalError {
+        image.parse().map_err(|e| oci::OciError::InvalidDigest {
             message: format!("invalid image reference: {e:#}"),
         })?;
-    let img = crate::resolve_oci_image(repo, &reference).map_err(|e| {
-        if let Some(nf) = e.downcast_ref::<composefs_oci::OciRefNotFound>() {
-            oci::OciError::NoSuchImage {
-                image: nf.name.clone(),
-            }
-        } else if let Some(nf) = e.downcast_ref::<composefs_oci::OciImageNotFound>() {
-            oci::OciError::NoSuchImage {
-                image: nf.digest.clone(),
-            }
-        } else {
-            oci::OciError::InternalError {
-                message: format!("{e:#}"),
-            }
-        }
-    })?;
+    let img = crate::resolve_oci_image(repo, &reference).map_err(oci_image_error)?;
 
     oci::OciInspectReply::from_image(repo, &img).map_err(|e| oci::OciError::InternalError {
         message: format!("{e:#}"),
@@ -829,7 +837,7 @@ async fn run_tag<ObjectID: FsVerityHashValue>(
     let digest: composefs_oci::OciDigest =
         manifest_digest
             .parse()
-            .map_err(|e| oci::OciError::InternalError {
+            .map_err(|e| oci::OciError::InvalidDigest {
                 message: format!("invalid digest: {e}"),
             })?;
     composefs_oci::oci_image::tag_image(repo, &digest, &name).map_err(|e| {
@@ -864,19 +872,15 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
     xattrs: Option<composefs_oci::XattrFiltering>,
 ) -> std::result::Result<oci::OciComputeIdReply, oci::OciError> {
     let reference: crate::OciReference =
-        image.parse().map_err(|e| oci::OciError::InternalError {
+        image.parse().map_err(|e| oci::OciError::InvalidDigest {
             message: format!("invalid image reference: {e:#}"),
         })?;
     let verity_override =
-        crate::verity_opt::<ObjectID>(&verity).map_err(|e| oci::OciError::InternalError {
+        crate::verity_opt::<ObjectID>(&verity).map_err(|e| oci::OciError::InvalidDigest {
             message: format!("invalid verity: {e:#}"),
         })?;
     let (config_digest, config_verity) =
-        crate::resolve_oci_config(repo, &reference, verity_override).map_err(|e| {
-            oci::OciError::InternalError {
-                message: format!("{e:#}"),
-            }
-        })?;
+        crate::resolve_oci_config(repo, &reference, verity_override).map_err(oci_image_error)?;
 
     let transform_opts = composefs_oci::OciTransformOptions {
         xattrs: xattrs.unwrap_or_default(),
@@ -3199,6 +3203,9 @@ pub(crate) fn spawn_in_process(
     Ok((client_conn, handle))
 }
 
+#[cfg(test)]
+mod error_tests;
+
 #[cfg(all(test, feature = "oci"))]
 mod layer_sync_tests {
     //! In-process round-trip tests for the layer-sync methods of the
@@ -3779,6 +3786,28 @@ mod layer_sync_tests {
             .await
             .unwrap()
             .expect("finalize_image");
+
+        // Validate mount errors before any privileged mount syscall, reusing
+        // this test's imported image instead of building another OCI fixture.
+        for (params, variant) in [
+            (
+                super::MountParams {
+                    overlay: Some(true),
+                    read_write: None,
+                },
+                "InvalidRequest",
+            ),
+            (super::MountParams::default(), "InternalError"),
+        ] {
+            let err = super::run_oci_mount(&repo_b, "finalize-test:v1", true, &params, vec![])
+                .unwrap_err();
+            super::error_tests::error(
+                serde_json::to_value(err).unwrap(),
+                "Oci",
+                variant,
+                serde_json::Value::Null,
+            );
+        }
 
         // Digests must be non-empty strings.
         assert!(
