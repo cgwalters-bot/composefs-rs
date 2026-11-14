@@ -89,12 +89,10 @@ pub const INLINE_CONTENT_MAX_V0: usize = 64;
 /// Maximum inline content size accepted when parsing untrusted input (dumpfiles,
 /// EROFS images in composefs-restricted mode).
 ///
-/// Only enforced for v2 images; the C code does not check this limit.
-///
-/// This is intentionally higher than [`INLINE_CONTENT_MAX_V0`] to allow for future
-/// increases to the inline threshold (see
-/// <https://github.com/composefs/composefs-rs/issues/107>).
-pub const MAX_INLINE_CONTENT: usize = 512;
+/// Matches `LCFS_INLINE_CONTENT_MAX` in composefs-c's `libcomposefs/lcfs-writer.h`
+/// at ec2573a0f68f548ae91f3e10acc990a08f9122dc. This bounds decoded bytes,
+/// not dumpfile escape text, and does not change the automatic inline threshold.
+pub const MAX_INLINE_CONTENT: usize = 5000;
 
 /// Maximum symlink target length in bytes.
 ///

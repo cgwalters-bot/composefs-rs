@@ -477,7 +477,7 @@ impl<'img> Image<'img> {
     ///
     /// Checked during inode traversal (`inode_blocks`, `erofs_to_filesystem`):
     /// - For non-ChunkBased inodes, `size` must not exceed the image size
-    /// - Inline regular files must be ≤ `MAX_INLINE_CONTENT` (512 bytes)
+    /// - Inline regular files must be ≤ `MAX_INLINE_CONTENT` (5000 decoded bytes)
     /// - Metacopy xattrs must be well-formed when present
     pub fn restrict_to_composefs(mut self) -> Result<Self, ErofsReaderError> {
         // Validate composefs header
@@ -1901,9 +1901,7 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                                 child_inode.size(),
                             ))
                         } else {
-                            if img.composefs_restricted
-                                && img.header.composefs_version == COMPOSEFS_VERSION
-                            {
+                            if img.composefs_restricted {
                                 let size = child_inode.size();
                                 if size > MAX_INLINE_CONTENT as u64 {
                                     anyhow::bail!(

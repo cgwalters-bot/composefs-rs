@@ -106,6 +106,15 @@ pub(crate) fn validate_filesystem<ObjectID: FsVerityHashValue>(
     // Check EROFS-specific constraint: whiteout inodes (chardev rdev=0) must not be hardlinked.
     let nlinks = fs.nlinks();
     for (idx, leaf) in fs.leaves.iter().enumerate() {
+        if let tree::LeafContent::Regular(tree::RegularFile::Inline(data)) = &leaf.content
+            && data.len() > crate::MAX_INLINE_CONTENT
+        {
+            anyhow::bail!(
+                "inline content length {} exceeds maximum {}",
+                data.len(),
+                crate::MAX_INLINE_CONTENT
+            );
+        }
         if matches!(leaf.content, tree::LeafContent::CharacterDevice(0)) {
             let nlink = nlinks[idx];
             if nlink > 1 {
@@ -420,11 +429,11 @@ struct Directory<'a> {
 struct Leaf<'a, ObjectID: FsVerityHashValue> {
     content: &'a tree::LeafContent<ObjectID>,
     nlink: usize,
-    /// Epoch1 only: number of full data blocks for inline content.
+    /// Number of data blocks for inline content.
     /// Matches C mkcomposefs which splits large inline files into data blocks
-    /// plus an optional inline tail. Zero for V2 or small files.
+    /// plus an optional inline tail. Zero for small files.
     n_data_blocks: u32,
-    /// Epoch1 only: size of the inline tail. When the tail exceeds half a block,
+    /// Size of the inline tail. When the tail exceeds half a block,
     /// it's promoted to a full data block (n_data_blocks++) and tail becomes 0.
     inline_tail_size: usize,
 }
@@ -1239,47 +1248,44 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
             !(matches!(leaf.content, tree::LeafContent::CharacterDevice(0)) && nlink > 1),
             "ValidatedFileSystem guarantees whiteout nlink == 1"
         );
-        let (n_data_blocks, inline_tail_size) = if self.version.epoch() == FormatEpoch::Epoch1 {
-            match &leaf.content {
-                tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
-                    if data.is_empty() {
-                        (0, 0)
-                    } else {
-                        let block_size = format::BLOCK_SIZE as usize;
-                        let mut n_blocks = data.len() / block_size;
-                        let mut tail = data.len() % block_size;
-                        if tail > block_size / 2 {
-                            n_blocks += 1;
-                            tail = 0;
-                        }
-                        (n_blocks as u32, tail)
+        let (n_data_blocks, inline_tail_size) =
+            if let tree::LeafContent::Regular(tree::RegularFile::Inline(data)) = &leaf.content {
+                // Keep existing small-file layouts, including V2, unchanged. A full
+                // block cannot be a tail: EROFS readers use size % BLOCK_SIZE.
+                let block_size = format::BLOCK_SIZE as usize;
+                let mut blocks = data.len() / block_size;
+                let mut tail = data.len() % block_size;
+                if tail > block_size / 2 {
+                    blocks += 1;
+                    tail = 0;
+                }
+                (blocks as u32, tail)
+            } else if self.version.epoch() == FormatEpoch::Epoch1 {
+                match &leaf.content {
+                    tree::LeafContent::Symlink(target) => {
+                        // Initial: no data blocks, tail = target length.
+                        // May be promoted to data block later by fixup_symlink_data_blocks
+                        // when inode_header + xattr_size + target_len >= BLOCK_SIZE.
+                        (0, target.len())
                     }
+                    tree::LeafContent::Regular(
+                        tree::RegularFile::External(.., size)
+                        | tree::RegularFile::ExternalNoVerity(.., size)
+                        | tree::RegularFile::Sparse(size),
+                    ) if *size > 0 => {
+                        let chunk_count = compute_chunk_count(*size);
+                        (0, chunk_count as usize * 4)
+                    }
+                    _ => (0, 0),
                 }
-                tree::LeafContent::Symlink(target) => {
-                    // Initial: no data blocks, tail = target length.
-                    // May be promoted to data block later by fixup_symlink_data_blocks
-                    // when inode_header + xattr_size + target_len >= BLOCK_SIZE.
-                    (0, target.len())
+            } else {
+                match &leaf.content {
+                    tree::LeafContent::Regular(tree::RegularFile::External(..)) => {
+                        (0, 4) // single null chunk index
+                    }
+                    _ => (0, 0),
                 }
-                tree::LeafContent::Regular(
-                    tree::RegularFile::External(.., size)
-                    | tree::RegularFile::ExternalNoVerity(.., size)
-                    | tree::RegularFile::Sparse(size),
-                ) if *size > 0 => {
-                    let chunk_count = compute_chunk_count(*size);
-                    (0, chunk_count as usize * 4)
-                }
-                _ => (0, 0),
-            }
-        } else {
-            match &leaf.content {
-                tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => (0, data.len()),
-                tree::LeafContent::Regular(tree::RegularFile::External(..)) => {
-                    (0, 4) // single null chunk index
-                }
-                _ => (0, 0),
-            }
-        };
+            };
         let inode = self.push_inode(
             &leaf.stat,
             InodeContent::Leaf(Leaf {

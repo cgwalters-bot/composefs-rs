@@ -234,6 +234,119 @@ fn test_erofs_digest_stability() {
     }
 }
 
+#[test]
+fn test_inline_storage_boundaries() {
+    use composefs::erofs::reader::{Image, InodeHeader, InodeOps, erofs_to_filesystem};
+
+    for version in [FormatVersion::V0, FormatVersion::V1, FormatVersion::V2] {
+        for len in [0, 512, 513, 2048, 2049, 4095, 4096, 4097, 5000, 5001] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+            add_leaf(
+                &mut fs,
+                "inline",
+                LeafContent::Regular(RegularFile::Inline(data.clone().into())),
+            );
+            let validated = ValidatedFileSystem::new(fs);
+            if len > composefs::MAX_INLINE_CONTENT {
+                assert!(
+                    validated
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeds maximum")
+                );
+                continue;
+            }
+            let image = mkfs_erofs_versioned(&validated.unwrap(), version);
+            let img = Image::open(&image)
+                .unwrap()
+                .restrict_to_composefs()
+                .unwrap();
+            img.fsck_metadata().unwrap();
+            let nid = img
+                .find_child_nid(img.sb.root_nid.get().into(), b"inline")
+                .unwrap()
+                .unwrap();
+            let inode = img.inode(nid).unwrap();
+            assert_eq!(inode.size(), len as u64);
+            let tail = len % 4096;
+            let tail = if tail > 2048 { 0 } else { tail };
+            assert_eq!(inode.inline().map_or(0, <[u8]>::len), tail);
+            assert_eq!(
+                img.inode_blocks(&inode).unwrap().count(),
+                (len - tail).div_ceil(4096)
+            );
+            let read = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+            let content = read
+                .leaves
+                .iter()
+                .find_map(|leaf| match &leaf.content {
+                    LeafContent::Regular(RegularFile::Inline(data)) => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(content.as_ref(), data, "{version:?}, {len}");
+            if len == 5000 {
+                // Reject oversized declarations before collecting any file data.
+                let mut malformed = image.to_vec();
+                let offset = nid as usize * 32 + 8;
+                malformed[offset..offset + 4].copy_from_slice(&5001u32.to_le_bytes());
+                let error = erofs_to_filesystem::<Sha256HashValue>(&malformed).unwrap_err();
+                assert!(format!("{error:#}").contains("max 5000"), "{error:#}");
+                // Block addresses must still be checked against the image bounds.
+                let mut malformed = image.to_vec();
+                let offset = nid as usize * 32 + 16;
+                malformed[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                assert!(erofs_to_filesystem::<Sha256HashValue>(&malformed).is_err());
+            }
+        }
+    }
+}
+
+/// Run against tests/assets from composefs-c ec2573a0f68f548ae91f3e10acc990a08f9122dc.
+/// Kept opt-in so the corpus is not vendored and normal tests need no network.
+#[test]
+#[ignore = "set COMPOSEFS_C_CORPUS to the pinned composefs-c tests/assets directory"]
+fn test_c_inline_corpus() {
+    let assets = std::path::PathBuf::from(
+        std::env::var_os("COMPOSEFS_C_CORPUS").expect("COMPOSEFS_C_CORPUS"),
+    );
+    for entry in std::fs::read_dir(&assets).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("should-fail-")
+            && path.extension().is_some_and(|e| e == "dump")
+        {
+            let bytes = std::fs::read(&path).unwrap();
+            // The dumpfile API takes UTF-8; non-UTF-8 negative fixtures are
+            // rejected at the text-decoding boundary.
+            if let Ok(dump) = std::str::from_utf8(&bytes) {
+                assert!(
+                    dumpfile_to_filesystem::<Sha256HashValue>(dump).is_err(),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+    for (name, version) in [
+        ("special.dump", FormatVersion::V0),
+        ("special_v1.dump", FormatVersion::V1),
+    ] {
+        let dump = std::fs::read_to_string(assets.join(name)).unwrap();
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dump).unwrap();
+        let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs).unwrap(), version);
+        composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+        eprintln!(
+            "{name}: {}",
+            composefs::fsverity::compute_verity::<Sha256HashValue>(&image).to_hex()
+        );
+    }
+}
+
 /// Test that V0 with a whiteout (char device rdev=0) round-trips correctly.
 /// Whiteouts are escaped to regular files in both V0 and V1 Epoch1 formats.
 #[test]
@@ -270,8 +383,7 @@ fn test_v0_whiteout_round_trip() {
 /// `--min-version=1 --max-version=1` behaviour.
 ///
 /// Uses a trimmed version of the C test suite's `special_v1.dump` fixture
-/// (the `inline-large*` entries were removed since Rust intentionally rejects
-/// inline content larger than `MAX_INLINE_CONTENT`).
+/// (the `inline-large*` entries were removed when Rust's parser limit was 512).
 ///
 /// Golden digest verified against C mkcomposefs 1.0.8+.
 #[test_with::executable(mkcomposefs)]

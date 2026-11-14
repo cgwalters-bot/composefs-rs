@@ -22,6 +22,9 @@ use rustix::fs::FileType;
 
 use crate::MAX_INLINE_CONTENT;
 
+// C's lcfs_node_validate caps non-inline files at 1024 chunks of at most 2^43 bytes.
+const DUMPFILE_NONINLINE_SIZE_MAX: u64 = 1024 * (1 << (12 + 31));
+
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L13
 const PATH_MAX: u32 = 4096;
 use crate::SYMLINK_MAX;
@@ -155,6 +158,9 @@ fn unescape_limited(s: &str, max: usize) -> Result<Cow<'_, [u8]>> {
             anyhow::bail!("Input exceeded maximum length {max}");
         }
         if c != '\\' {
+            if c.len_utf8() > max - r.len() {
+                anyhow::bail!("Input exceeded maximum length {max}");
+            }
             write!(r, "{c}").unwrap();
             continue;
         }
@@ -338,6 +344,9 @@ impl<'k> Xattr<'k> {
             .ok_or_else(|| anyhow!("Missing = in xattrs"))?;
         let key = unescape_to_osstr(key)?;
         let keylen = key.as_bytes().len();
+        if keylen == 0 {
+            anyhow::bail!("xattr name cannot be empty");
+        }
         if keylen > XATTR_NAME_MAX {
             anyhow::bail!("xattr name too long; max={XATTR_NAME_MAX} found={keylen}");
         }
@@ -437,6 +446,11 @@ impl<'p> Entry<'p> {
                 FileType::RegularFile => {
                     Self::check_rdev(rdev)?;
                     if let Some(path) = payload.as_ref() {
+                        if size > DUMPFILE_NONINLINE_SIZE_MAX {
+                            anyhow::bail!(
+                                "Non-inline file size {size} exceeds maximum {DUMPFILE_NONINLINE_SIZE_MAX}"
+                            );
+                        }
                         let path = unescape_to_path(path)?;
                         Item::Regular {
                             size,
@@ -446,8 +460,20 @@ impl<'p> Entry<'p> {
                         }
                     } else {
                         // A dumpfile entry with no backing path or payload is treated as an empty file
+                        let has_content = content.is_some();
                         let content = content.unwrap_or_default();
                         let content = unescape_limited(content, MAX_INLINE_CONTENT)?;
+                        if has_content && content.len() as u64 != size {
+                            anyhow::bail!(
+                                "Inline content length {} does not match size {size}",
+                                content.len()
+                            );
+                        }
+                        if content.is_empty() && size > DUMPFILE_NONINLINE_SIZE_MAX {
+                            anyhow::bail!(
+                                "Non-inline file size {size} exceeds maximum {DUMPFILE_NONINLINE_SIZE_MAX}"
+                            );
+                        }
                         if fsverity_digest.is_some() {
                             anyhow::bail!("Inline file cannot have fsverity digest");
                         }
@@ -717,6 +743,49 @@ mod tests {
         };
 
         Ok(())
+    }
+
+    #[test]
+    fn test_decoded_inline_limits() {
+        for len in [0, 512, 513, 2048, 2049, 4095, 4096, 4097, 5000, 5001] {
+            for (encoded_byte, decoded_byte) in [("a", b'a'), (r"\x00", 0), (r"\n", b'\n')] {
+                let encoded = encoded_byte.repeat(len);
+                let line = format!("/inline {len} 100644 1 0 0 0 0.0 - {encoded} -");
+                let result = Entry::parse(&line);
+                assert_eq!(result.is_ok(), len <= MAX_INLINE_CONTENT, "len={len}");
+                if let Ok(entry) = result {
+                    let Item::RegularInline { content, .. } = entry.item else {
+                        panic!()
+                    };
+                    assert_eq!(&*content, vec![decoded_byte; len]);
+                }
+            }
+        }
+        for (text, max, valid) in [
+            ("é", 1, false),
+            ("é", 2, true),
+            ("aé", 2, false),
+            ("aéz", 2, false),
+        ] {
+            assert_eq!(unescape_limited(text, max).is_ok(), valid);
+        }
+        for text in ["é".repeat(2500), format!("{}é", "a".repeat(4999))] {
+            let line = format!("/inline {} 100644 1 0 0 0 0.0 - {text} -", text.len());
+            assert_eq!(
+                Entry::parse(&line).is_ok(),
+                text.len() <= MAX_INLINE_CONTENT
+            );
+        }
+        for content in ["", "a", r"\x00"] {
+            let line = format!("/inline 2 100644 1 0 0 0 0.0 - {content} -");
+            assert!(
+                Entry::parse(&line)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+        }
+        assert!(Entry::parse("/inline 0 100644 1 0 0 0 0.0 - - -").is_ok());
     }
 
     #[test]
