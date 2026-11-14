@@ -1,5 +1,7 @@
 # composefs examples
 
+> This text is LLM generated.
+
 This directory contains a few different approaches to using `cfsctl` to produce
 a verified operating system image.
 
@@ -54,3 +56,52 @@ Host tt.*
 ```
 
 So you can access the test machine via `ssh tt.0` and so on.
+
+## Apt setup transport checks
+
+The [G3 evidence](https://github.com/cgwalters-forge/tracker/blob/main/docs/composefs-rs-ci-2026-11-03.md#g3--new-issue-candidate-no-exact-covering-issue-found)
+records archive EOF, timeout and connection failures before example tests in
+`sudo apt install -y crun/plucky podman/plucky`. The concrete threat is an
+archive connection closing or stalling during setup, not a test flake or a
+solver failure. Use apt's native acquisition recovery rather than retrying
+the command or job.
+
+Run `just test-apt-acquire` explicitly on Linux with apt-get, dpkg-deb and
+Python 3. It uses a runtime-built package and loopback HTTP archive, isolated
+apt configuration (including preferences/auth), status, indexes and cache.
+It never installs packages or accesses an external mirror. It checks recovery
+after two EOFs, persistent EOF/idle-timeout exhaustion, missing packages,
+dependency conflicts and a failed update with cached indexes. A negative
+control disables acquisition retries and must fail on the same transient EOF.
+Raw apt output is withheld; success reports exits, requests and elapsed times.
+
+The candidate invocation-local settings are:
+
+```sh
+-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15
+```
+
+This allows two acquisition retries, not retries of solving or installation.
+The tested single-URI HTTP stall consumes at most six requests (one internal
+reconnect per acquisition attempt), six 15-second waits and 1+2 seconds
+backoff. The harness enforces a 108-second per-command deadline including
+15 seconds scheduling slack. These are **idle** timeouts, not a whole-setup
+deadline: multiple packages, address selection or a continuously sending peer
+can take longer. HTTPS has a corresponding timeout but is not fault-tested;
+the recorded archive URLs use HTTP.
+
+Also set `-o APT::Update::Error-Mode=any` on each update so failed refreshes
+cannot succeed using cached indexes. Keep final failures, packages, suites,
+mirrors and test commands unchanged; do not use `--fix-missing` or global apt
+configuration.
+
+**Not wired into CI:** `.github/` is protected in this run, so production
+behavior is unchanged. In `.github/workflows/ci.yml`, the pending callers are
+the examples job's `Install dependencies`, `Get a newer podman for heredoc
+support (from plucky)` and `Ensure patched tools are installed` apt invocations.
+Add the acquisition options to each update/install/build-dep and the strict
+update option to each update. This is required before claiming #62 is fixed.
+After wiring, record three authorized setup attempts on the exact resulting
+revision on Ubuntu 24.04, with exits and elapsed times, then validate VM example
+tests separately. Local fault injection is neither live setup nor VM evidence;
+do not enable or dispatch Actions implicitly.

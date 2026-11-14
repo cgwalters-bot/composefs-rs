@@ -36,6 +36,10 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# Opt-in real apt transport fault tests (apt-get, dpkg-deb, Python 3; about 110s)
+test-apt-acquire:
+    python3 ci/test-apt-acquire.py
+
 # Check that fuzz targets compile
 check-fuzz:
     cargo check --manifest-path crates/composefs/fuzz/Cargo.toml
