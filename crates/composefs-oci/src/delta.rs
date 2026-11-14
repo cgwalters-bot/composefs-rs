@@ -479,16 +479,7 @@ mod tests {
             .expect("importing source layer");
 
         let mut fs = composefs::tree::FileSystem::new(composefs::tree::Stat::uninitialized());
-        let mut stream = repo
-            .open_stream(
-                "",
-                Some(&layer_id),
-                Some(crate::skopeo::TAR_LAYER_CONTENT_TYPE),
-            )
-            .expect("opening source layer stream");
-        while let Some(entry) = crate::tar::get_entry(&mut stream).expect("reading tar entry") {
-            crate::image::process_entry(&mut fs, entry).expect("processing tar entry");
-        }
+        crate::image::process_layer(&mut fs, repo, &layer_id).expect("processing source layer");
 
         ComposeFsDataSource {
             source: Arc::new(SourceImage {

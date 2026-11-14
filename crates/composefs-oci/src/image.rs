@@ -5,10 +5,10 @@
 //! and constructs the final filesystem tree that can be mounted or analyzed.
 //!
 //! The main functionality centers around `create_filesystem()` which takes an OCI image configuration
-//! and builds a complete filesystem by processing all layers in order. The `process_entry()` function
-//! handles individual tar entries and implements overlayfs whiteout semantics for proper layer merging.
+//! and builds a complete filesystem by processing all layers in order. The `process_layer()` function
+//! applies whiteouts before ordinary entries so that they affect only lower layers.
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use composefs::digest::{Digest, Sha256};
@@ -17,7 +17,7 @@ use fn_error_context::context;
 
 use composefs::{
     fsverity::FsVerityHashValue,
-    generic_tree::OciTransformOptions,
+    generic_tree::{ImageError, OciTransformOptions},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
 };
@@ -27,11 +27,48 @@ use containers_image_proxy::oci_spec::image::Digest as OciDigest;
 use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
 use crate::tar::{TarEntry, TarItem};
 
+fn whiteout_name(path: &Path) -> Option<&OsStr> {
+    path.file_name()?
+        .as_bytes()
+        .strip_prefix(b".wh.")
+        .map(OsStr::from_bytes)
+}
+
+/// Apply a layer's whiteouts to the lower tree before adding its ordinary
+/// entries. Replay the splitstream rather than buffering the layer, retaining
+/// tar order for directory metadata, replacements, and hardlink targets.
+///
+/// This costs two sequential decompression/parsing passes over the splitstream's
+/// inline data (including headers and small files), but does not read external
+/// file payloads or retain the layer's entries in memory. Content checksum
+/// validation, when needed, is performed separately by [`create_filesystem`].
+#[context("Processing container layer")]
+pub fn process_layer<ObjectID: FsVerityHashValue>(
+    filesystem: &mut FileSystem<ObjectID>,
+    repo: &Repository<ObjectID>,
+    layer_verity: &ObjectID,
+) -> Result<()> {
+    for whiteouts in [true, false] {
+        let mut stream = repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut stream)? {
+            if whiteout_name(&entry.path).is_some() == whiteouts {
+                process_entry(filesystem, entry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Processes a single tar entry and adds it to the filesystem.
 ///
 /// Handles various tar entry types (regular files, directories, symlinks, hardlinks, devices, fifos)
 /// and implements overlayfs whiteout semantics for proper layer merging. Files named `.wh.<name>`
-/// delete the corresponding file, and `.wh..wh.opq` marks a directory as opaque (clearing all contents).
+/// delete the corresponding file, and `.wh..wh..opq` marks a directory as opaque (clearing all contents).
+/// Whiteouts under missing or non-directory parents are no-ops.
+///
+/// This function has no layer boundary information: callers assembling layers
+/// must apply all whiteouts before ordinary entries, as in [`process_layer`],
+/// so they affect only lower-layer contents. Do not call it in raw tar order.
 ///
 /// Returns an error if the entry cannot be processed or added to the filesystem.
 #[context("Processing tar entry")]
@@ -39,6 +76,23 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     filesystem: &mut FileSystem<ObjectID>,
     entry: TarEntry<ObjectID>,
 ) -> Result<()> {
+    if let Some(whiteout) = whiteout_name(&entry.path) {
+        let (dir, _) = match filesystem.root.split_mut(entry.path.as_os_str()) {
+            Ok(pair) => pair,
+            // Absent and non-directory lower parents have no children to hide.
+            // A non-directory may be replaced by a directory in this layer.
+            // This also handles nested markers after an ancestor was removed.
+            Err(ImageError::NotFound(_) | ImageError::NotADirectory(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if whiteout.as_bytes() == b".wh..opq" {
+            dir.clear();
+        } else {
+            dir.remove(whiteout);
+        }
+        return Ok(());
+    }
+
     if entry.path.file_name().is_none() {
         // special handling for the root directory
         ensure!(
@@ -59,8 +113,14 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
             Inode::leaf(id)
         }
         TarItem::Hardlink(target) => {
-            let (dir, filename) = filesystem.root.split(&target)?;
-            Inode::leaf(dir.leaf_id(filename)?)
+            let context = || {
+                format!(
+                    "Resolving hardlink target {target:?} for container layer entry {:?}",
+                    entry.path
+                )
+            };
+            let (dir, filename) = filesystem.root.split(&target).with_context(context)?;
+            Inode::leaf(dir.leaf_id(filename).with_context(context)?)
         }
     };
 
@@ -69,22 +129,12 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
         .split_mut(entry.path.as_os_str())
         .with_context(|| {
             format!(
-                "Error unpacking container layer file {:?} {:?}",
-                entry.path, inode
+                "Resolving destination parent for container layer entry {:?}",
+                entry.path
             )
         })?;
 
-    let bytes = filename.as_bytes();
-    if let Some(whiteout) = bytes.strip_prefix(b".wh.") {
-        if whiteout == b".wh..opq" {
-            // complete name is '.wh..wh..opq'
-            dir.clear();
-        } else {
-            dir.remove(OsStr::from_bytes(whiteout));
-        }
-    } else {
-        dir.merge(filename, inode);
-    }
+    dir.merge(filename, inode);
 
     Ok(())
 }
@@ -136,11 +186,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
             );
         }
 
-        let mut layer_stream =
-            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
-        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
-            process_entry(&mut filesystem, entry)?;
-        }
+        process_layer(&mut filesystem, repo, layer_verity)?;
     }
 
     // Apply OCI container transformations for consistent digests.  This also
@@ -331,6 +377,172 @@ mod test {
         let data = builder.into_inner().unwrap();
         let diff_id = crate::sha256_content_digest(&data).to_string();
         (data, diff_id)
+    }
+
+    /// Import real tar layers and assemble them through the production OCI path.
+    async fn filesystem_from_tars(layers: &[Vec<u8>]) -> Result<FileSystem<Sha256HashValue>> {
+        let test_repo = composefs::test::TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let mut config_stream = repo.create_stream(crate::skopeo::OCI_CONFIG_CONTENT_TYPE)?;
+        let mut diff_ids = vec![];
+        for tar in layers {
+            let digest = crate::sha256_content_digest(tar);
+            let (verity, _) = crate::import_layer(repo, &digest, None, &tar[..]).await?;
+            config_stream.add_named_stream_ref(digest.as_ref(), &verity);
+            diff_ids.push(digest.to_string());
+        }
+        let config = crate::test_util::make_config_json(&diff_ids);
+        let digest = crate::sha256_content_digest(&config);
+        config_stream.write_external(&config)?;
+        repo.write_stream(config_stream, &crate::config_identifier(&digest), None)?;
+        create_filesystem(repo, &digest, None, &OciTransformOptions::default())
+    }
+
+    #[tokio::test]
+    async fn test_layer_whiteout_file_order() -> Result<()> {
+        for lower_exists in [false, true] {
+            for marker_position in 0..=2 {
+                let mut lower = ::tar::Builder::new(vec![]);
+                append_tar_dir(&mut lower, "usr");
+                if lower_exists {
+                    append_tar_file(&mut lower, "usr/file", b"lower");
+                }
+                let mut upper = ::tar::Builder::new(vec![]);
+                for position in 0..=2 {
+                    if position == marker_position {
+                        append_tar_file(&mut upper, "usr/.wh.file", b"");
+                    }
+                    match position {
+                        0 => append_tar_file(&mut upper, "usr/file", b"upper"),
+                        1 => append_tar_hardlink(&mut upper, "usr/link", "usr/file"),
+                        _ => {}
+                    }
+                }
+                let layers = vec![lower.into_inner()?, upper.into_inner()?];
+                let fs = filesystem_from_tars(&layers).await?;
+                assert_files(&fs, &["/", "/usr", "/usr/file", "/usr/link"]).with_context(|| {
+                    format!("lower={lower_exists}, marker_position={marker_position}")
+                })?;
+                let (dir, name) = fs.root.split(OsStr::new("/usr/file"))?;
+                let id = dir.leaf_id(name)?;
+                assert_eq!(id, dir.leaf_id(OsStr::new("link"))?);
+                assert!(matches!(
+                    &fs.leaf(id).content,
+                    LeafContent::Regular(RegularFile::Inline(data)) if data.as_ref() == b"upper"
+                ));
+
+                // A subsequent layer must still be able to remove the survivor.
+                let mut removal = ::tar::Builder::new(vec![]);
+                append_tar_file(&mut removal, "usr/.wh.file", b"");
+                let mut layers = layers;
+                layers.push(removal.into_inner()?);
+                let fs = filesystem_from_tars(&layers).await?;
+                assert_files(&fs, &["/", "/usr", "/usr/link"])?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_layer_whiteout_opaque_order() -> Result<()> {
+        for marker_position in 0..=3 {
+            let mut lower = ::tar::Builder::new(vec![]);
+            append_tar_dir(&mut lower, "usr");
+            append_tar_dir(&mut lower, "usr/sub");
+            append_tar_file(&mut lower, "usr/sub/old", b"lower subtree");
+            append_tar_file(&mut lower, "usr/old", b"lower child");
+            let mut upper = ::tar::Builder::new(vec![]);
+            for position in 0..=3 {
+                if position == marker_position {
+                    append_tar_file(&mut upper, "usr/.wh..wh..opq", b"");
+                }
+                match position {
+                    0 => append_tar_file(&mut upper, "usr/new", b"upper child"),
+                    1 => append_tar_dir(&mut upper, "usr/sub"),
+                    2 => append_tar_file(&mut upper, "usr/sub/new", b"upper subtree"),
+                    _ => {}
+                }
+            }
+            let fs = filesystem_from_tars(&[lower.into_inner()?, upper.into_inner()?]).await?;
+            assert_files(&fs, &["/", "/usr", "/usr/new", "/usr/sub", "/usr/sub/new"])
+                .with_context(|| format!("opaque position={marker_position}"))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_layer_whiteout_missing_and_overlapping_parents() -> Result<()> {
+        for markers in [
+            &["usr/new/.wh.missing", "usr/new/.wh..wh..opq"][..],
+            &["usr/.wh.new", "usr/new/.wh.missing", "usr/new/.wh..wh..opq"],
+            &["usr/new/.wh..wh..opq", "usr/new/.wh.missing", "usr/.wh.new"],
+            &["usr/.wh..wh..opq", "usr/new/.wh..wh..opq"],
+            &["usr/new/.wh..wh..opq", "usr/.wh..wh..opq"],
+        ] {
+            for lower_exists in [false, true] {
+                let mut lower = ::tar::Builder::new(vec![]);
+                append_tar_dir(&mut lower, "usr");
+                if lower_exists {
+                    append_tar_dir(&mut lower, "usr/new");
+                    append_tar_file(&mut lower, "usr/new/missing", b"lower");
+                }
+                let mut upper = ::tar::Builder::new(vec![]);
+                for marker in markers {
+                    append_tar_file(&mut upper, marker, b"");
+                }
+                append_tar_dir(&mut upper, "usr/new");
+                append_tar_file(&mut upper, "usr/new/keep", b"upper");
+                let fs = filesystem_from_tars(&[lower.into_inner()?, upper.into_inner()?]).await?;
+                assert_files(&fs, &["/", "/usr", "/usr/new", "/usr/new/keep"])?;
+            }
+        }
+
+        // Non-directory lower parents have no children to hide either.
+        for symlink in [false, true] {
+            for marker in ["usr/new/.wh.file", "usr/new/.wh..wh..opq"] {
+                let mut lower = ::tar::Builder::new(vec![]);
+                append_tar_dir(&mut lower, "usr");
+                if symlink {
+                    append_tar_symlink(&mut lower, "usr/new", "elsewhere");
+                } else {
+                    append_tar_file(&mut lower, "usr/new", b"lower");
+                }
+                let mut upper = ::tar::Builder::new(vec![]);
+                append_tar_dir(&mut upper, "usr/new");
+                append_tar_file(&mut upper, marker, b"");
+                append_tar_file(&mut upper, "usr/new/keep", b"upper");
+                let fs = filesystem_from_tars(&[lower.into_inner()?, upper.into_inner()?]).await?;
+                assert_files(&fs, &["/", "/usr", "/usr/new", "/usr/new/keep"])?;
+            }
+        }
+
+        // Ordinary entries still require directory parents.
+        for parent_is_file in [true, false] {
+            let mut lower = ::tar::Builder::new(vec![]);
+            append_tar_dir(&mut lower, "usr");
+            if parent_is_file {
+                append_tar_file(&mut lower, "usr/new", b"not a directory");
+            }
+            let mut upper = ::tar::Builder::new(vec![]);
+            append_tar_file(&mut upper, "usr/new/file", b"");
+            let error = filesystem_from_tars(&[lower.into_inner()?, upper.into_inner()?])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                (
+                    error.downcast_ref::<composefs::generic_tree::ImageError>(),
+                    parent_is_file
+                ),
+                (
+                    Some(composefs::generic_tree::ImageError::NotADirectory(_)),
+                    true
+                ) | (
+                    Some(composefs::generic_tree::ImageError::NotFound(_)),
+                    false
+                )
+            ));
+        }
+        Ok(())
     }
 
     /// Comprehensive round-trip test: build a busybox-like tar layer via
@@ -532,6 +744,130 @@ mod test {
             "total entry count (dirs + files + symlinks + hardlinks)"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_entry_errors_report_full_path() -> Result<()> {
+        for (destination, target, expected_error) in [
+            ("/usr/missing/file", None, "not found"),
+            ("/usr/file/child", None, "not a directory"),
+            ("/usr/link", Some("/usr/missing/target"), "not found"),
+            ("/usr/link", Some("/usr/absent"), "not found"),
+            ("/usr/link", Some("/usr/file/target"), "not a directory"),
+            ("/usr/link", Some("/usr/directory"), "is a directory"),
+        ] {
+            let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+            process_entry(&mut fs, dir_entry("/usr"))?;
+            process_entry(&mut fs, dir_entry("/usr/directory"))?;
+            process_entry(&mut fs, file_entry("/usr/file"))?;
+            let mut entry = file_entry(destination);
+            if let Some(target) = target {
+                entry.item = TarItem::Hardlink(OsStr::new(target).into());
+            }
+
+            let err = process_entry(&mut fs, entry).unwrap_err();
+            let chain = format!("{err:#}");
+            assert!(chain.contains("Processing tar entry"), "{chain}");
+            assert!(chain.contains(destination), "{chain}");
+            if let Some(target) = target {
+                assert!(chain.contains("Resolving hardlink target"), "{chain}");
+                assert!(chain.contains(target), "{chain}");
+            } else {
+                assert!(chain.contains("Resolving destination parent"), "{chain}");
+            }
+            match (err.downcast_ref::<ImageError>(), expected_error) {
+                (Some(ImageError::NotFound(_)), "not found")
+                | (Some(ImageError::NotADirectory(_)), "not a directory")
+                | (Some(ImageError::IsADirectory(_)), "is a directory") => {}
+                _ => panic!("Unexpected error category: {chain}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_layer_whiteout_preserves_order_and_metadata() -> Result<()> {
+        let mut expected = None;
+        for marker_position in 0..=4 {
+            let mut tar = ::tar::Builder::new(vec![]);
+            for position in 0..=4 {
+                if position == marker_position {
+                    append_tar_file(&mut tar, ".wh..wh..opq", b"");
+                }
+                match position {
+                    0 => append_tar_dir(&mut tar, "."),
+                    1 => append_tar_dir(&mut tar, "usr"),
+                    2 => append_tar_file(&mut tar, "usr/file", b"original"),
+                    3 => append_tar_hardlink(&mut tar, "usr/link", "usr/file"),
+                    _ => {}
+                }
+            }
+            // A later replacement must not change an earlier hardlink's target.
+            append_tar_file(&mut tar, "usr/file", b"replacement");
+            let mut header = ::tar::Header::new_ustar();
+            header.set_entry_type(::tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o750);
+            header.set_uid(42);
+            header.set_gid(43);
+            header.set_mtime(123);
+            tar.append_data(&mut header, "usr", std::io::empty())?;
+            let tar = tar.into_inner()?;
+            let test_repo = composefs::test::TestRepo::<Sha256HashValue>::new();
+            let repo = &test_repo.repo;
+            let digest = crate::sha256_content_digest(&tar);
+            let (verity, _) = crate::import_layer(repo, &digest, None, &tar[..]).await?;
+            let mut fs = FileSystem::new(Stat::uninitialized());
+            process_layer(&mut fs, repo, &verity)?;
+            assert_eq!(fs.root.stat.st_mode, 0o755);
+            let (usr, _) = fs.root.split(OsStr::new("usr/file"))?;
+            assert_eq!(usr.stat.st_mode, 0o750);
+            assert_eq!(usr.stat.st_uid, 42);
+            assert_eq!(usr.stat.st_gid, 43);
+            assert_eq!(usr.stat.st_mtim_sec, 123);
+            for (name, content) in [("file", &b"replacement"[..]), ("link", &b"original"[..])] {
+                let id = usr.leaf_id(OsStr::new(name))?;
+                assert!(matches!(
+                    &fs.leaf(id).content,
+                    LeafContent::Regular(RegularFile::Inline(data)) if data.as_ref() == content
+                ));
+            }
+            fs.transform_for_oci(&OciTransformOptions::default())?;
+            fs.fsck()?;
+            assert_eq!(fs.root.stat.st_mode, 0o750);
+            let mut dump = vec![];
+            write_dumpfile(&mut dump, &fs)?;
+            if let Some(expected) = &expected {
+                assert_eq!(&dump, expected);
+            } else {
+                expected = Some(dump);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_entry_whiteout_lower_parents() -> Result<()> {
+        for marker in ["usr/parent/.wh.file", "usr/parent/.wh..wh..opq"] {
+            for parent in [
+                None,
+                Some(file_entry("usr/parent")),
+                Some(dir_entry("usr/parent")),
+            ] {
+                let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+                process_entry(&mut fs, dir_entry("usr"))?;
+                if let Some(parent) = parent {
+                    process_entry(&mut fs, parent)?;
+                }
+                let mut before = vec![];
+                write_dumpfile(&mut before, &fs)?;
+                process_entry(&mut fs, file_entry(marker))?;
+                let mut after = vec![];
+                write_dumpfile(&mut after, &fs)?;
+                assert_eq!(before, after);
+            }
+        }
         Ok(())
     }
 
